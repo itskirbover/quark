@@ -22,6 +22,14 @@ bool Buffer::open(const std::string& path) {
     }
     std::string content((std::istreambuf_iterator<char>(in)),
                         std::istreambuf_iterator<char>());
+    if (content.empty()) {
+        lines_.push_back("");
+        trailingNewline_ = false;
+        dirty_ = false;
+        return true;
+    }
+    trailingNewline_ = content.back() == '\n';
+    if (trailingNewline_) content.pop_back();  // store lines, not the terminator
     // Split on '\n', strip trailing '\r' (CRLF files).
     size_t start = 0;
     while (true) {
@@ -47,10 +55,10 @@ bool Buffer::saveAs(const std::string& path) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) return false;
     for (size_t i = 0; i < lines_.size(); ++i) {
+        if (i > 0) out << '\n';
         out << lines_[i];
-        if (i + 1 < lines_.size()) out << '\n';
     }
-    if (!lines_.empty()) out << '\n';
+    if (trailingNewline_ && !lines_.empty()) out << '\n';
     if (!out) return false;
     filename_ = path;
     dirty_ = false;

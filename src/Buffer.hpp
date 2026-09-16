@@ -34,4 +34,7 @@ private:
     std::vector<std::string> lines_;
     std::string filename_;
     bool dirty_ = false;
+    // Whether the file ends with a newline (preserved across load/save so
+    // round-trips neither add phantom blank lines nor drop the final \n).
+    bool trailingNewline_ = true;
 };

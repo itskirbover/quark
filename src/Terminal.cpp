@@ -13,6 +13,7 @@ bool g_haveOrig = false;
 Terminal::Terminal() { refreshSize(); }
 
 Terminal::~Terminal() {
+    disableMouse();
     exitAltScreen();
     disableRaw();
 }
@@ -59,6 +60,9 @@ void Terminal::exitAltScreen() {
 
 void Terminal::hideCursor() { writeRaw("\x1b[?25l"); }
 void Terminal::showCursor() { writeRaw("\x1b[?25h"); }
+
+void Terminal::enableMouse() { writeRaw("\x1b[?1000h\x1b[?1006h"); }
+void Terminal::disableMouse() { writeRaw("\x1b[?1006l\x1b[?1000l"); }
 
 bool Terminal::refreshSize() {
     struct winsize ws {};

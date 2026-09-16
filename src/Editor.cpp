@@ -16,6 +16,7 @@ int Editor::run(const std::string& path) {
     kitty::detectSupport(supp_);
 
     term_.enterAltScreen();
+    term_.enableMouse();
     Renderer renderer(term_, buf_, supp_);
     renderer_ = &renderer;
 
@@ -29,6 +30,7 @@ int Editor::run(const std::string& path) {
             handleNormalKey(k);
     }
 
+    term_.disableMouse();
     term_.exitAltScreen();
     term_.disableRaw();
 
@@ -151,6 +153,22 @@ void Editor::handleNormalKey(const Key& k) {
             break;
         }
         case Key::Type::Delete: buf_.deleteForward(cy_, cx_); break;
+        case Key::Type::MousePress: {
+            size_t nx = cx_, ny = cy_;
+            if (renderer_ &&
+                renderer_->screenToLogical(k.mouseCol, k.mouseRow, cx_, cy_,
+                                           nx, ny)) {
+                cy_ = ny;
+                cx_ = nx;
+            }
+            break;
+        }
+        case Key::Type::WheelUp:
+            for (int i = 0; i < 3; ++i) moveUp();
+            break;
+        case Key::Type::WheelDown:
+            for (int i = 0; i < 3; ++i) moveDown();
+            break;
         case Key::Type::Char:
             buf_.insertText(cy_, cx_, k.text);
             cx_ += k.text.size();

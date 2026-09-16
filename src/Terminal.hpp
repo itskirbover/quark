@@ -22,6 +22,11 @@ public:
     void hideCursor();
     void showCursor();
 
+    // SGR mouse tracking (1000 + 1006): button presses/releases and wheel.
+    // Shifted clicks are left for the terminal (selection bypass).
+    void enableMouse();
+    void disableMouse();
+
     bool refreshSize();
     int rows() const { return rows_; }
     int cols() const { return cols_; }

@@ -12,6 +12,40 @@
 class Terminal;
 class Buffer;
 
+// Combined inline style key for span lookup.
+struct Style {
+    bool bold = false, italic = false, code = false, strike = false,
+         link = false;
+    bool operator==(const Style& o) const {
+        return bold == o.bold && italic == o.italic && code == o.code &&
+               strike == o.strike && link == o.link;
+    }
+    bool operator!=(const Style& o) const { return !(*this == o); }
+};
+
+// One emitted run: byte range, combined style, OSC width (0 = auto-split).
+// For packed fractional groups, chars = ASCII char count (advance per char
+// is s*w/chars); solo graphemes have chars = 1.
+struct Segment {
+    size_t start = 0, end = 0;
+    Style style;
+    int w = 0;
+    int chars = 0;
+};
+
+// Everything draw/click-mapping needs for one logical line: tab-expanded
+// text, style/skip data remapped into it, and emitted segments shared by
+// emission, cursor advance, and click mapping.
+struct LineLayout {
+    std::string text;
+    size_t contentStart = 0;
+    std::vector<Span> spans;
+    std::vector<std::pair<size_t, size_t>> skip;
+    std::vector<Segment> segs;
+    std::vector<size_t> byteMap;  // original -> text offsets; empty = identity
+    bool sized = false;
+};
+
 class Renderer {
 public:
     Renderer(Terminal& term, Buffer& buf, const KittySupport& supp);
@@ -24,6 +58,11 @@ public:
 
     size_t topLine() const { return topLine_; }
 
+    // Map 1-based screen coordinates to a buffer cursor (false = ignore:
+    // status bar, out of range). curCx/curCy drive span reveal state.
+    bool screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
+                         size_t& outCx, size_t& outCy);
+
 private:
     Terminal& term_;
     Buffer& buf_;
@@ -31,8 +70,10 @@ private:
     size_t topLine_ = 0;
 
     void ensureVisible(size_t cy, int viewRows);
-    void emitLine(const std::string& line, size_t contentStart,
-                  const std::string& baseSgr, const std::vector<Span>& spans,
-                  const std::vector<std::pair<size_t, size_t>>& conceal,
-                  const HeaderStyle& style, bool concealed, int cols);
+    LineLayout layoutLine(const std::string& line, size_t contentStart,
+                          const std::vector<Span>& spans,
+                          const std::vector<std::pair<size_t, size_t>>& skip,
+                          const HeaderStyle& style, size_t markerCells);
+    void emitLayout(const LineLayout& lay, const std::string& baseSgr,
+                    const HeaderStyle& style);
 };

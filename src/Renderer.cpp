@@ -1,6 +1,8 @@
 #include "Renderer.hpp"
 
 #include <algorithm>
+#include <ctime>
+#include <numeric>
 
 #include "Buffer.hpp"
 #include "Markdown.hpp"
@@ -28,30 +30,6 @@ size_t cellsBefore(const std::string& line, size_t from, size_t to) {
     return col;
 }
 
-// Advance in terminal columns from absolute column baseCol over
-// line[from,to) under a HeaderStyle. Mirrors emitLine: each grapheme takes
-// s * cellWidth cells; tabs use absolute 8-stops.
-size_t advanceCells(const std::string& line, size_t from, size_t to,
-                    const HeaderStyle& st, bool scaled, size_t baseCol) {
-    int s = scaled ? st.s : 1;
-    size_t col = baseCol;
-    size_t i = from;
-    if (i > line.size()) i = line.size();
-    if (to > line.size()) to = line.size();
-    while (i < to) {
-        auto [cp, len] = utf8::decode(line, i);
-        if (len == 0) break;
-        if (cp == '\t') {
-            col = (col / 8 + 1) * 8;
-        } else {
-            int w = utf8::charWidth(cp);
-            col += static_cast<size_t>(s * w);
-        }
-        i += len;
-    }
-    return col - baseCol;
-}
-
 // Tab-expanded copy of a line's content region (tabs -> spaces, 8-stops
 // from baseCol), with contentStart/spans remapped. Needed because raw tabs
 // inside Kitty sizing escapes don't behave like terminal tab stops.
@@ -60,6 +38,7 @@ struct ExpandedLine {
     size_t contentStart = 0;
     std::vector<Span> spans;
     std::vector<std::pair<size_t, size_t>> skip;
+    std::vector<size_t> byteMap;  // original byte offset -> text offset
 };
 
 ExpandedLine expandTabs(const std::string& line, size_t contentStart,
@@ -101,6 +80,10 @@ ExpandedLine expandTabs(const std::string& line, size_t contentStart,
         size_t ne = remap(s.start + s.len);
         s.start = ns;
         s.len = (ne > ns) ? ne - ns : 0;
+        size_t rs = remap(s.srcStart);
+        size_t re = remap(s.srcEnd);
+        s.srcStart = rs;
+        s.srcEnd = (re > rs) ? re : rs;
     }
     out.skip = skip;
     for (auto& r : out.skip) {
@@ -109,18 +92,9 @@ ExpandedLine expandTabs(const std::string& line, size_t contentStart,
         r.first = ns;
         r.second = (ne > ns) ? ne : ns;
     }
+    out.byteMap = map;
     return out;
 }
-
-// Combined style key for span lookup.
-struct Style {
-    bool bold = false, italic = false, code = false, strike = false, link = false;
-    bool operator==(const Style& o) const {
-        return bold == o.bold && italic == o.italic && code == o.code &&
-               strike == o.strike && link == o.link;
-    }
-    bool operator!=(const Style& o) const { return !(*this == o); }
-};
 
 Style styleAt(const std::vector<Span>& spans, size_t byteOff) {
     Style st;
@@ -148,6 +122,257 @@ std::string styleSgr(const Style& st) {
 
 std::string cup(int row1, int col1) {
     return "\x1b[" + std::to_string(row1) + ";" + std::to_string(col1) + "H";
+}
+
+// Visible cell width ignoring SGR sequences.
+size_t visibleWidth(const std::string& s) {
+    size_t w = 0, i = 0;
+    while (i < s.size()) {
+        if (s[i] == '\x1b' && i + 1 < s.size() && s[i + 1] == '[') {
+            i += 2;
+            while (i < s.size() && s[i] != 'm') ++i;
+            if (i < s.size()) ++i;
+        } else {
+            auto [cp, len] = utf8::decode(s, i);
+            if (len == 0) break;
+            w += static_cast<size_t>(utf8::charWidth(cp));
+            i += len;
+        }
+    }
+    return w;
+}
+
+// End-truncate to maxCells cells at a codepoint boundary.
+std::string truncateCells(const std::string& s, size_t maxCells) {
+    size_t w = 0, i = 0;
+    while (i < s.size()) {
+        auto [cp, len] = utf8::decode(s, i);
+        if (len == 0) break;
+        size_t cw = static_cast<size_t>(utf8::charWidth(cp));
+        if (w + cw > maxCells) break;
+        w += cw;
+        i += len;
+    }
+    return s.substr(0, i);
+}
+
+// Terminal rows a logical line occupies: marker own-row (H1-H3, scaled)
+// plus content rows.
+int blockRows(const ParsedLine& p, bool scaled) {
+    int rows = 1;
+    if (scaled) {
+        rows = headerStyle(p).rows;
+        if (p.headerLevel >= 1 && p.headerLevel <= 3) rows += 1;
+    }
+    return rows;
+}
+
+// Merge overlapping ranges (defensive; the parser emits disjoint ones).
+std::vector<std::pair<size_t, size_t>> mergedRanges(
+    std::vector<std::pair<size_t, size_t>> ranges) {
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<size_t, size_t>> out;
+    for (const auto& r : ranges) {
+        if (!out.empty() && r.first <= out.back().second) {
+            out.back().second = std::max(out.back().second, r.second);
+        } else {
+            out.push_back(r);
+        }
+    }
+    return out;
+}
+
+// Conceal ranges minus spans revealed by the cursor: a span reveals (shows
+// raw source) when the cursor lies in its full source extent. Without a
+// cursor on the line, everything concealed stays hidden.
+std::vector<std::pair<size_t, size_t>> skipRangesFor(
+    const std::vector<Span>& spans,
+    const std::vector<std::pair<size_t, size_t>>& conceal, bool hasCursor,
+    size_t cx) {
+    if (!hasCursor) return mergedRanges(conceal);
+    std::vector<std::pair<size_t, size_t>> keep;
+    for (const auto& r : conceal) {
+        bool revealed = false;
+        for (const auto& s : spans) {
+            if (cx >= s.srcStart && cx <= s.srcEnd && r.first >= s.srcStart &&
+                r.second <= s.srcEnd) {
+                revealed = true;
+                break;
+            }
+        }
+        if (!revealed) keep.push_back(r);
+    }
+    return mergedRanges(keep);
+}
+
+// Split content into emitted segments, skipping concealed ranges.
+// ASCII runs group by style (flushed past 3000B); with fractional packing
+// (packN/packD, H2/H3) ASCII groups carry explicit w so advance matches the
+// shrunken glyphs: smallest exact group first (combined while w <= 7),
+// remainders via ceil (safe: slight gap, never truncation).
+// Every other grapheme is its own segment with explicit width.
+// skipped must be merged.
+std::vector<Segment> layoutContent(
+    const std::string& text, size_t cs, const std::vector<Span>& spans,
+    const std::vector<std::pair<size_t, size_t>>& skipped, int packN,
+    int packD) {
+    int G0 = 0, W0 = 0, maxK = 0;
+    if (packN > 0 && packD > packN) {
+        int g = std::gcd(packN, packD);
+        G0 = packD / g;
+        W0 = packN / g;
+        maxK = W0 > 0 ? 7 / W0 : 0;
+        if (maxK < 1) maxK = 1;
+    }
+    std::vector<Segment> segs;
+    size_t skipIdx = 0;
+    size_t i = cs;
+    size_t runStart = cs;
+    Style curStyle{};
+    bool haveCur = false;
+    auto flushRun = [&](size_t end) {
+        if (end <= runStart) return;
+        if (G0 == 0) {
+            Segment g;
+            g.start = runStart;
+            g.end = end;
+            g.style = curStyle;
+            g.w = 0;
+            segs.push_back(g);
+            return;
+        }
+        // Pure ASCII run: bytes == chars. Full exact groups first
+        // (combined while w <= 7), then a ceil-rounded remainder.
+        size_t total = end - runStart;
+        size_t p = runStart;
+        while (total > 0) {
+            size_t take;
+            int w;
+            size_t fullGroups = total / static_cast<size_t>(G0);
+            if (fullGroups > 0) {
+                size_t k = std::min(fullGroups, static_cast<size_t>(maxK));
+                take = k * static_cast<size_t>(G0);
+                w = static_cast<int>(k) * W0;
+            } else {
+                take = total;
+                w = static_cast<int>((take * static_cast<size_t>(packN) +
+                                      static_cast<size_t>(packD) - 1) /
+                                     static_cast<size_t>(packD));
+                if (w < 1) w = 1;
+                if (w > 7) w = 7;
+            }
+            Segment g;
+            g.start = p;
+            g.end = p + take;
+            g.style = curStyle;
+            g.w = w;
+            g.chars = static_cast<int>(take);
+            segs.push_back(g);
+            p += take;
+            total -= take;
+        }
+    };
+    while (i < text.size()) {
+        auto [cp, len] = utf8::decode(text, i);
+        if (len == 0) break;
+        while (skipIdx < skipped.size() && i >= skipped[skipIdx].second)
+            ++skipIdx;
+        if (skipIdx < skipped.size() && i >= skipped[skipIdx].first) {
+            flushRun(i);
+            runStart = i + len;
+            i = runStart;
+            continue;
+        }
+        Style st = styleAt(spans, i);
+        int w = utf8::charWidth(cp);
+        if (!(cp < 0x80 && w == 1)) {
+            flushRun(i);
+            int cw = w <= 0 ? 1 : w;
+            Segment g;
+            g.start = i;
+            g.end = i + len;
+            g.style = st;
+            if (G0 == 0) {
+                g.w = cw;
+            } else {
+                int ww = (cw * packN + packD - 1) / packD;
+                if (ww < 1) ww = 1;
+                if (ww > 7) ww = 7;
+                g.w = ww;
+            }
+            g.chars = 1;
+            segs.push_back(g);
+            i += len;
+            runStart = i;
+            haveCur = false;
+            continue;
+        }
+        if (!haveCur) {
+            curStyle = st;
+            haveCur = true;
+        } else if (st != curStyle) {
+            flushRun(i);
+            curStyle = st;
+            runStart = i;
+        }
+        i += len;
+        if (i - runStart >= 3000) {
+            flushRun(i);
+            runStart = i;  // keep style: no redundant SGR mid-run
+        }
+    }
+    flushRun(i);
+    return segs;
+}
+
+// Count ASCII width-1 chars in [a,b) (packed groups are pure ASCII).
+size_t countAscii1(const std::string& text, size_t a, size_t b) {
+    size_t n = 0;
+    size_t i = std::min(a, text.size());
+    size_t end = std::min(b, text.size());
+    while (i < end) {
+        auto [cp, len] = utf8::decode(text, i);
+        if (len == 0) break;
+        if (cp < 0x80 && utf8::charWidth(cp) == 1) ++n;
+        i += len;
+    }
+    return n;
+}
+
+// Display advance of [.., upto) in columns from baseCol over segments.
+// Tabs use absolute 8-stops; sized explicit-w segments advance whole, with
+// proportional (floored) partials inside packed ASCII groups.
+size_t advanceUpTo(const std::string& text, const std::vector<Segment>& segs,
+                   int s, bool useW, size_t baseCol, size_t upto) {
+    size_t col = baseCol;
+    for (const auto& g : segs) {
+        if (upto <= g.start) break;
+        size_t e = std::min(upto, g.end);
+        if (useW && g.w > 0) {
+            if (e >= g.end) {
+                col += static_cast<size_t>(s * g.w);
+            } else {
+                size_t k = countAscii1(text, g.start, e);
+                int c = g.chars > 0 ? g.chars : 1;
+                col += (k * static_cast<size_t>(s) *
+                        static_cast<size_t>(g.w)) /
+                       static_cast<size_t>(c);
+            }
+        } else {
+            size_t k = g.start;
+            while (k < e) {
+                auto [cp, len] = utf8::decode(text, k);
+                if (len == 0) break;
+                if (cp == '\t') {
+                    col = (col / 8 + 1) * 8;
+                } else {
+                    col += static_cast<size_t>(s * utf8::charWidth(cp));
+                }
+                k += len;
+            }
+        }
+    }
+    return col - baseCol;
 }
 
 }  // namespace
@@ -180,9 +405,7 @@ void Renderer::ensureVisible(size_t cy, int viewRows) {
         for (size_t i = topLine_; i <= cy && i < n; ++i) {
             bool f = fence;
             ParsedLine p = parseLine(buf_.line(i), f);
-            int sc = 1;
-            if (supp_.scale) sc = headerStyle(p).rows;
-            used += sc;
+            used += blockRows(p, supp_.scale);
             fence = f;
         }
         if (used <= viewRows || topLine_ >= cy) break;
@@ -196,130 +419,206 @@ void Renderer::ensureVisible(size_t cy, int viewRows) {
     }
 }
 
-void Renderer::emitLine(const std::string& line, size_t contentStart,
-                        const std::string& baseSgr, const std::vector<Span>& spans,
-                        const std::vector<std::pair<size_t, size_t>>& conceal,
-                        const HeaderStyle& style, bool concealed, int cols) {
-    (void)cols;
-    bool sized = supp_.scale && style.s > 1;
-
-    // Tabs inside sizing escapes don't act as tab stops: expand content tabs
-    // to spaces first (cursor math uses the original line with tab stops from
-    // the same base column, so columns stay consistent).
-    ExpandedLine owned;
-    const std::string* lineP = &line;
-    const std::vector<Span>* spansP = &spans;
-    const std::vector<std::pair<size_t, size_t>>* skipP = &conceal;
-    size_t cs = contentStart;
-    if (sized && line.find('\t', std::min(contentStart, line.size())) !=
-                     std::string::npos) {
-        // markerCells is unknown here; recompute cheaply (ASCII fast path).
-        size_t markerCells = cellsBefore(line, 0, contentStart);
-        owned = expandTabs(line, contentStart, spans, conceal, markerCells);
-        lineP = &owned.text;
-        spansP = &owned.spans;
-        skipP = &owned.skip;
-        cs = owned.contentStart;
+LineLayout Renderer::layoutLine(const std::string& line, size_t contentStart,
+                                const std::vector<Span>& spans,
+                                const std::vector<std::pair<size_t, size_t>>& skip,
+                                const HeaderStyle& style, size_t markerCells) {
+    LineLayout lay;
+    lay.sized = supp_.scale && style.s > 1;
+    lay.contentStart = contentStart;
+    lay.spans = spans;
+    lay.skip = skip;
+    if (lay.sized &&
+        line.find('\t', std::min(contentStart, line.size())) !=
+            std::string::npos) {
+        // Tabs inside sizing escapes don't act as tab stops: expand content
+        // tabs to spaces first (cursor math maps original offsets through
+        // byteMap, so columns stay consistent).
+        ExpandedLine owned =
+            expandTabs(line, contentStart, spans, skip, markerCells);
+        lay.text = std::move(owned.text);
+        lay.contentStart = owned.contentStart;
+        lay.spans = std::move(owned.spans);
+        lay.skip = std::move(owned.skip);
+        lay.byteMap = std::move(owned.byteMap);
+    } else {
+        lay.text = line;
     }
-    const std::string& text = *lineP;
-    const std::vector<Span>& sp = *spansP;
+    lay.segs = layoutContent(lay.text, lay.contentStart, lay.spans, lay.skip,
+                             (lay.sized && style.n > 0 && style.d > style.n)
+                                 ? style.n
+                                 : 0,
+                             (lay.sized && style.n > 0 && style.d > style.n)
+                                 ? style.d
+                                 : 0);
+    return lay;
+}
 
-    // Merge conceal ranges (defensive; the parser emits non-overlapping ones).
-    std::vector<std::pair<size_t, size_t>> skip;
-    if (concealed && skipP && !skipP->empty()) {
-        skip = *skipP;
-        std::sort(skip.begin(), skip.end());
-        std::vector<std::pair<size_t, size_t>> merged;
-        for (const auto& r : skip) {
-            if (!merged.empty() && r.first <= merged.back().second) {
-                merged.back().second =
-                    std::max(merged.back().second, r.second);
-            } else {
-                merged.push_back(r);
-            }
-        }
-        skip.swap(merged);
-    }
-    // Offsets are visited in increasing order, so a cursor works.
-    size_t skipIdx = 0;
-    auto isSkipped = [&](size_t off) -> bool {
-        while (skipIdx < skip.size() && off >= skip[skipIdx].second) ++skipIdx;
-        return skipIdx < skip.size() && off >= skip[skipIdx].first;
-    };
-
+void Renderer::emitLayout(const LineLayout& lay, const std::string& baseSgr,
+                          const HeaderStyle& style) {
     std::string out;
-    out.reserve(text.size() + 64);
-
-    auto flushAsciiRun = [&](const std::string& run) {
-        if (run.empty()) return;
-        if (!sized) {
-            out += run;
-            return;
-        }
-        // Auto-split into s-by-s cells (split defensively under 4096B).
-        size_t pos = 0;
-        while (pos < run.size()) {
-            size_t chunk = std::min<size_t>(3000, run.size() - pos);
-            out += kitty::sized(run.substr(pos, chunk), style.s, 0,
-                                style.n, style.d, style.v, style.h);
-            pos += chunk;
-        }
-    };
-
-    // Walk content codepoint by codepoint, grouping by style.
-    size_t i = cs;
-    std::string asciiRun;
-    Style curStyle{false, false, false, false, false};
-    bool haveCur = false;
-    auto flushRun = [&]() {
-        flushAsciiRun(asciiRun);
-        asciiRun.clear();
-    };
-
+    out.reserve(lay.text.size() + 64);
     // Base SGR for the whole content (header color etc.).
     out += baseSgr;
-    while (i < text.size()) {
-        auto [cp, len] = utf8::decode(text, i);
-        if (len == 0) break;
-        if (!skip.empty() && isSkipped(i)) {
-            i += len;  // concealed delimiter: emit nothing, keep runs/styles
-            continue;
-        }
-        Style st = styleAt(sp, i);
-        if (!haveCur) {
-            curStyle = st;
-            haveCur = true;
-            out += styleSgr(st);
-        } else if (st != curStyle) {
-            flushRun();
-            out += sgr::kReset;
-            out += baseSgr;
-            out += styleSgr(st);
-            curStyle = st;
-        }
-        std::string ch = text.substr(i, len);
-        int w = utf8::charWidth(cp);
-        if (cp < 0x80 && w == 1) {
-            asciiRun += ch;
-            if (asciiRun.size() >= 3000) flushRun();
-        } else {
-            flushRun();
-            int cw = w <= 0 ? 1 : w;
-            if (sized) {
-                if (cw > 7) cw = 7;  // clamp; terminal does best-effort
-                out += kitty::sized(ch, style.s, cw, style.n, style.d,
-                                    style.v, style.h);
-            } else if (supp_.width && cw > 1) {
-                out += kitty::sized(ch, 1, cw);  // pin width, no scaling
-            } else {
-                out += ch;
+    Style curStyle{};
+    bool haveCur = false;
+    for (const auto& g : lay.segs) {
+        if (!haveCur || g.style != curStyle) {
+            if (haveCur) {
+                out += sgr::kReset;
+                out += baseSgr;
             }
+            out += styleSgr(g.style);
+            curStyle = g.style;
+            haveCur = true;
         }
-        i += len;
+        std::string chunk = lay.text.substr(g.start, g.end - g.start);
+        if (!lay.sized) {
+            if (supp_.width && g.w > 1) {
+                out += kitty::sized(chunk, 1, g.w);  // pin width, no scaling
+            } else {
+                out += chunk;
+            }
+        } else if (g.w == 0) {
+            // Auto-split into s-by-s cells (split defensively under 4096B).
+            size_t pos = 0;
+            while (pos < chunk.size()) {
+                size_t n = std::min<size_t>(3000, chunk.size() - pos);
+                out += kitty::sized(chunk.substr(pos, n), style.s, 0,
+                                    style.n, style.d, style.v, style.h);
+                pos += n;
+            }
+        } else {
+            int w = g.w > 7 ? 7 : g.w;
+            out += kitty::sized(chunk, style.s, w, style.n, style.d,
+                                style.v, style.h);
+        }
     }
-    flushRun();
     out += sgr::kReset;
     term_.writeStr(out);
+}
+
+bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
+                               size_t& outCx, size_t& outCy) {
+    int rows = term_.rows();
+    int cols = term_.cols();
+    if (sx < 1 || sx > cols || sy < 1 || sy > rows - 1) return false;
+    size_t n = buf_.lineCount();
+    if (n == 0 || topLine_ >= n) return false;
+    int target = sy - 1;  // 0-based screen row
+    // Fence-aware walk from topLine_, mirroring draw().
+    bool inFence = false;
+    for (size_t y = 0; y < topLine_; ++y) {
+        ParsedLine tmp = parseLine(buf_.line(y), inFence);
+        (void)tmp;
+    }
+    int screenRow = 0;
+    for (size_t y = topLine_; y < n; ++y) {
+        const std::string& line = buf_.line(y);
+        ParsedLine p = parseLine(line, inFence);
+        int mrows =
+            (supp_.scale && p.headerLevel >= 1 && p.headerLevel <= 3) ? 1 : 0;
+        HeaderStyle hs = supp_.scale ? headerStyle(p) : HeaderStyle{};
+        int total = mrows + hs.rows;
+        if (target < screenRow || target >= screenRow + total) {
+            screenRow += total;
+            continue;
+        }
+        // Click inside this logical line's block.
+        outCy = y;
+        bool plainKind = (p.block == BlockType::Empty ||
+                          p.block == BlockType::CodeFence ||
+                          p.block == BlockType::CodeBlock ||
+                          p.block == BlockType::HRule);
+        if (!plainKind && mrows > 0 && target == screenRow) {
+            outCx = 0;  // marker own-row: edit from line start
+            return true;
+        }
+        size_t markerCells = 0;
+        size_t cs = 0;
+        if (!plainKind && !p.marker.empty()) {
+            markerCells = cellsBefore(line, 0, p.marker.size());
+            cs = p.contentStart;
+        }
+        bool hasCursor = (y == curCy);
+        auto skip0 = skipRangesFor(p.spans, p.conceal, hasCursor,
+                                   hasCursor ? curCx : 0);
+        int packN = 0, packD = 0;
+        bool sized = supp_.scale && hs.s > 1;
+        if (sized && hs.n > 0 && hs.d > hs.n) {
+            packN = hs.n;
+            packD = hs.d;
+        }
+        std::vector<Span> useSpans = plainKind ? std::vector<Span>{} : p.spans;
+        auto segs = layoutContent(line, cs, useSpans, skip0, packN, packD);
+        int s = sized ? hs.s : 1;
+        long rel = static_cast<long>(sx - 1) - static_cast<long>(markerCells);
+        if (rel < 0) {
+            // Inside the inline marker: walk marker bytes at s = 1.
+            size_t k = 0;
+            size_t col = 0;
+            size_t end = std::min(p.marker.size(), line.size());
+            while (k < end) {
+                auto [cp, len] = utf8::decode(line, k);
+                if (len == 0) break;
+                size_t gad = (cp == '\t')
+                                 ? ((col / 8 + 1) * 8 - col)
+                                 : static_cast<size_t>(utf8::charWidth(cp));
+                if (rel < static_cast<long>(col + gad)) break;
+                col += gad;
+                k += len;
+            }
+            outCx = k;
+            return true;
+        }
+        // Inverse segment walk from the content origin.
+        size_t abscol = markerCells;
+        size_t acc = 0;
+        size_t targetCol = static_cast<size_t>(rel);
+        for (const auto& g : segs) {
+            size_t segAdv;
+            if (sized && g.w > 0) {
+                segAdv = static_cast<size_t>(s * g.w);
+            } else {
+                segAdv = 0;
+                size_t k = g.start;
+                while (k < g.end) {
+                    auto [cp, len] = utf8::decode(line, k);
+                    if (len == 0) break;
+                    size_t cur = abscol + segAdv;
+                    size_t gad;
+                    if (cp == '\t') {
+                        gad = (cur / 8 + 1) * 8 - cur;
+                    } else {
+                        gad = static_cast<size_t>(s * utf8::charWidth(cp));
+                    }
+                    if (targetCol < acc + segAdv + gad) {
+                        outCx = k;  // click inside glyph -> its start
+                        return true;
+                    }
+                    segAdv += gad;
+                    k += len;
+                }
+            }
+            if (targetCol < acc + segAdv) {
+                // Inside an explicit-w segment: proportional char index.
+                int c = g.chars > 0 ? g.chars : 1;
+                size_t idx = (targetCol - acc) * static_cast<size_t>(c) /
+                             segAdv;  // segAdv >= 1 here
+                if (idx >= static_cast<size_t>(c))
+                    idx = static_cast<size_t>(c) - 1;
+                size_t off = (c > 1) ? std::min(g.start + idx, g.end)
+                                     : g.start;
+                outCx = off;
+                return true;
+            }
+            acc += segAdv;
+            abscol += segAdv;
+        }
+        outCx = line.size();  // past end -> EOL
+        return true;
+    }
+    return false;  // filler area below content: ignore
 }
 
 void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool promptActive,
@@ -359,29 +658,40 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
         const std::string& line = buf_.line(y);
         ParsedLine p = parseLine(line, inFence);
         HeaderStyle hs = supp_.scale ? headerStyle(p) : HeaderStyle{};
-        int sc = hs.rows;
+        int mrows = (supp_.scale && p.headerLevel >= 1 && p.headerLevel <= 3)
+                        ? 1
+                        : 0;
+        int sc = mrows + hs.rows;
         if (screenRow + sc > viewRows) break;  // never draw partial blocks
         term_.writeStr(cup(screenRow + 1, 1));
         term_.writeStr("\x1b[2K");  // erase stale multicells on this row
 
         if (p.block == BlockType::Empty) {
             // nothing
-        } else if (p.block == BlockType::CodeFence || p.block == BlockType::CodeBlock) {
+        } else if (p.block == BlockType::CodeFence) {
             term_.writeStr(sgr::kDim);
             term_.writeStr(line);
             term_.writeStr(sgr::kReset);
+        } else if (p.block == BlockType::CodeBlock) {
+            term_.writeStr(line);  // normal body text, no dimming
         } else if (p.block == BlockType::HRule) {
             term_.writeStr(sgr::kDim);
             term_.writeStr(line);
             term_.writeStr(sgr::kReset);
         } else {
-            // Marker dimmed at normal size, then styled content.
+            // Marker: own row above the content for H1-H3 (their glyphs are
+            // taller), inline dimmed marker otherwise.
             size_t markerCells = 0;
             if (!p.marker.empty()) {
                 term_.writeStr(sgr::kDim);
                 term_.writeStr(p.marker);
                 term_.writeStr(sgr::kReset);
                 markerCells = cellsBefore(line, 0, p.marker.size());
+            }
+            if (mrows > 0) {
+                ++screenRow;
+                term_.writeStr(cup(screenRow + 1, 1));
+                term_.writeStr("\x1b[2K");
             }
             std::string base;
             if (p.headerLevel >= 1) base = headerSgr(p.headerLevel);
@@ -392,22 +702,28 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
                 !p.marker.empty()) {
                 // marker already drawn dimmed; acceptable
             }
-            // Conceal inline markers (**, *, `, ~~, []()) on every line
-            // except the one being edited, which shows raw source.
-            bool concealedLine = (y != cy) || promptActive;
-            emitLine(line, p.contentStart, base, p.spans, p.conceal, hs,
-                     concealedLine, cols);
+            // Span-level reveal: hidden formatting shows raw source only
+            // when the cursor is inside the formatted span's extent.
+            bool hasCursor = (y == cy) && !promptActive;
+            auto skip0 = skipRangesFor(p.spans, p.conceal, hasCursor, cx);
+            LineLayout lay = layoutLine(line, p.contentStart, p.spans, skip0,
+                                        hs, markerCells);
+            emitLayout(lay, base, hs);
 
-            if (y == cy && !promptActive) {
+            if (hasCursor) {
                 size_t colCells;
                 if (cx < p.contentStart) {
                     colCells = cellsBefore(line, 0, cx);
                 } else {
-                    // Scaled advance: each grapheme takes s * allocated
-                    // cells (tabs use absolute 8-stops from markerCells).
-                    colCells = markerCells + advanceCells(line, p.contentStart,
-                                                          cx, hs, supp_.scale,
-                                                          markerCells);
+                    // Advance shared with emission; map original offsets
+                    // through tab expansion (tabs use absolute 8-stops).
+                    size_t upto = std::min(cx, line.size());
+                    if (!lay.byteMap.empty() && upto < lay.byteMap.size())
+                        upto = lay.byteMap[upto];
+                    int s = lay.sized ? hs.s : 1;
+                    colCells = markerCells +
+                               advanceUpTo(lay.text, lay.segs, s, lay.sized,
+                                           markerCells, upto);
                 }
                 cursorScreenRow = screenRow;
                 cursorScreenCol = static_cast<size_t>(1) + colCells;
@@ -425,7 +741,7 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
             cursorScreenCol = c;
             cursorPlaced = true;
         }
-        screenRow += sc;
+        screenRow += hs.rows;  // marker row (if any) counted inline
     }
     // Filler tilde rows.
     for (int r = screenRow; r < viewRows; ++r) {
@@ -436,35 +752,94 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
         term_.writeStr(sgr::kReset);
     }
 
-    // Status bar.
-    std::string bar;
+    // Status bar: LazyVim-like blocks (left = filename, right = context).
+    term_.writeStr(cup(rows, 1));
+    term_.writeStr("\x1b[2K");
     if (promptActive) {
-        bar = promptText + " (y/n)";
+        std::string bar = promptText + " (y/n)";
+        if (bar.size() > static_cast<size_t>(cols)) {
+            size_t cut = cols;
+            while (cut > 0 &&
+                   utf8::isContinuation(static_cast<unsigned char>(bar[cut])))
+                --cut;
+            bar.erase(cut);
+        }
+        bar += std::string(cols > (int)bar.size() ? (cols - bar.size()) : 0,
+                           ' ');
+        term_.writeStr("\x1b[7m");
+        term_.writeStr(bar);
+        term_.writeStr(sgr::kReset);
     } else {
         std::string name = buf_.filename().empty() ? "[no file]" : buf_.filename();
-        std::string mod = buf_.dirty() ? " [+]" : "";
+        std::string mod = buf_.dirty() ? "[+]" : "";
         size_t charCol = utf8::charCount(buf_.line(cy).substr(
             0, std::min(cx, buf_.line(cy).size())));
         std::string kittyTag = !supp_.any() ? "plain"
                                : (supp_.scale ? "kitty-full" : "kitty-width");
-        bar = " " + name + mod + " | Ln " + std::to_string(cy + 1) + "/" +
-              std::to_string(n) + " Col " + std::to_string(charCol + 1) + " | " +
-              kittyTag + (status.empty() ? "" : " | " + status) +
-              " | Ctrl-C quit  Ctrl-S save";
+        std::string pos = "Ln " + std::to_string(cy + 1) + "/" +
+                          std::to_string(n) + " Col " +
+                          std::to_string(charCol + 1);
+        std::string scroll = (cy == 0) ? "Top"
+                             : (cy + 1 >= n)
+                                   ? "Bot"
+                                   : std::to_string(cy * 100 /
+                                                    std::max<size_t>(n - 1, 1)) +
+                                         "%";
+        char tbuf[6] = "";
+        {
+            time_t t = time(nullptr);
+            strftime(tbuf, sizeof(tbuf), "%H:%M", localtime(&t));
+        }
+        // Tiered right side for narrow windows: clock, then scroll %.
+        // Position and kitty tag always stay; the filename truncates last.
+        // Tiers drop until the middle (status/hints) fits, if possible.
+        std::string midWant = status.empty()
+                                  ? "Ctrl-C quit  Ctrl-S save  click to move"
+                                  : " " + status;
+        size_t needMid = visibleWidth(midWant);
+        bool showClock = true, showScroll = true;
+        std::string right;
+        std::string leftText = " " + name + mod + " ";
+        size_t rightW = 0, maxLeft = 0, midAvail = 0;
+        for (;;) {
+            right = std::string(sgr::kDim) + " " + kittyTag + " " +
+                    sgr::kReset;
+            std::string posSeg = pos;
+            if (showScroll) posSeg = scroll + " " + posSeg;
+            right += std::string("\x1b[97;44m ") + posSeg + " " + sgr::kReset;
+            if (showClock)
+                right +=
+                    std::string("\x1b[30;104m ") + tbuf + " " + sgr::kReset;
+            rightW = visibleWidth(right);
+            maxLeft = (static_cast<size_t>(cols) > rightW + 1)
+                          ? static_cast<size_t>(cols) - rightW - 1
+                          : 0;
+            size_t leftW =
+                std::min(visibleWidth(leftText), maxLeft);
+            midAvail = (static_cast<size_t>(cols) > leftW + rightW)
+                           ? static_cast<size_t>(cols) - leftW - rightW
+                           : 0;
+            if (midAvail >= needMid || (!showClock && !showScroll)) break;
+            if (showClock)
+                showClock = false;
+            else
+                showScroll = false;
+        }
+        std::string leftShown = truncateCells(leftText, maxLeft);
+        std::string mid = truncateCells(midWant, midAvail);
+        size_t pad =
+            (midAvail > visibleWidth(mid)) ? midAvail - visibleWidth(mid) : 0;
+        term_.writeStr("\x1b[30;104m");
+        term_.writeStr(leftShown);
+        term_.writeStr(sgr::kReset);
+        if (!mid.empty()) {
+            term_.writeStr(sgr::kDim);
+            term_.writeStr(mid);
+            term_.writeStr(sgr::kReset);
+        }
+        term_.writeStr(std::string(pad, ' '));
+        term_.writeStr(right);
     }
-    // Truncate to cols (byte-safe-ish: ASCII status, filename may be UTF-8;
-    // truncate by bytes but avoid splitting mid-codepoint).
-    if (bar.size() > static_cast<size_t>(cols)) {
-        size_t cut = cols;
-        while (cut > 0 && utf8::isContinuation(static_cast<unsigned char>(bar[cut])))
-            --cut;
-        bar.erase(cut);
-    }
-    bar += std::string(cols > (int)bar.size() ? (cols - bar.size()) : 0, ' ');
-    term_.writeStr(cup(rows, 1));
-    term_.writeStr("\x1b[7m");
-    term_.writeStr(bar);
-    term_.writeStr(sgr::kReset);
 
     if (promptActive) {
         term_.writeStr(cup(rows, (int)promptText.size() + 7));

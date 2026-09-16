@@ -11,19 +11,24 @@ Outside kitty it degrades to SGR-only styling (status bar shows `plain`).
 
 | Level | Rows | Sizing | Look |
 |-------|------|--------|------|
-| `#` | 2 | `s=2` | 2× glyphs |
-| `##` | 2 | `s=2:n=3:d=4:v=2` | ~1.5×, vertically centered |
-| `###` | 2 | `s=2:n=1:d=2:v=2` | 1× with padding, centered |
+| `#` | 2 + marker row | `s=2` | 2× glyphs |
+| `##` | 2 + marker row | `s=2:n=3:d=4:v=2` + packed `w` | ~1.5×, tight, centered |
+| `###` | 2 + marker row | `s=2:n=1:d=2:v=2` + packed `w` | 1×, tight, centered |
 | `####` / `#####` / `######` | 1 | none | normal size, bold + color |
 
-All levels keep SGR bold + a per-level color.
+All levels keep SGR bold + a per-level color. H1–H3 draw their `#` marker
+dimmed on its own row (same size mismatch would look broken inline); H4–H6
+keep inline markers. Fractional H2/H3 pack characters into explicit-`w`
+groups so the advance matches the shrunken glyphs (no letter-spacing gaps).
 
 ## Concealed markers
 
-Inline markers (`**`, `*`, `_`, `~~`, backticks, `[`…`](url)`) are hidden on
-every line except the one under the cursor, which always shows raw source for
-editing. Block markers (`#`, `>`, `-`, `1.`) stay dimmed everywhere. Inline
-code renders bright-on-black.
+Inline markers (`**`, `*`, `_`, `~~`, backticks, `[`…`](url)`) are hidden
+except inside the formatted span under the cursor — move the cursor into
+`*text*` and its markers reappear for editing. Block markers (`#`, `>`,
+`-`, `1.`) stay dimmed everywhere. Inline code renders bright-on-black.
+Fenced code blocks render as normal body text (only the ```` ``` ````
+delimiters stay dimmed).
 
 ## Build
 
@@ -48,5 +53,15 @@ Try `test/sample.md` for headers, inline styles, emoji/CJK widths.
 |-----|--------|
 | Arrows, Home/End, PgUp/PgDn | Move cursor |
 | Type, Enter, Backspace, Delete | Edit |
+| Left click | Move cursor (needs a mouse-reporting terminal like kitty) |
+| Mouse wheel | Move cursor ±3 lines |
+| Shift+click | Terminal text selection (bypasses the app) |
 | Ctrl-S | Save |
 | Ctrl-C | Quit — always asks `Save …? (y/n)`; `y` saves + exits, `n` exits, `Esc` cancels |
+
+## Status bar
+
+LazyVim-inspired blocks: filename on the left, kitty support tag, scroll
+position (`Top`/`%`/`Bot`), cursor position and clock on the right. Narrow
+windows shed the clock, then the scroll %, then the hints — never the
+position.

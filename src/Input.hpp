@@ -21,12 +21,17 @@ struct Key {
         CtrlC,
         CtrlS,
         Esc,
+        MousePress,  // left button press (mouseCol/Row: 1-based screen)
+        WheelUp,
+        WheelDown,
         None,  // timeout / unknown
     };
 
     Type type = Type::None;
     std::string text;  // valid for Char
     uint32_t cp = 0;   // valid for Char
+    int mouseCol = 0;  // valid for MousePress (1-based screen column)
+    int mouseRow = 0;  // valid for MousePress (1-based screen row)
 
     static Key make(Type t) {
         Key k;

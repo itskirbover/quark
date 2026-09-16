@@ -3,6 +3,8 @@
 #include <sys/select.h>
 #include <unistd.h>
 
+#include <cstdio>
+
 #include "Utf8.hpp"
 
 namespace {
@@ -45,6 +47,35 @@ Key readEscapeSequence() {
     if (b1 == '[') {
         int b2 = readByte(50);
         if (b2 == -1) return Key::make(Key::Type::Esc);
+        if (b2 == '<') {
+            // SGR mouse (1006): ESC [ < Pb ; Px ; Py M/m.
+            std::string params;
+            int c = 0;
+            while (params.size() < 16) {
+                c = readByte(50);
+                if (c == -1) return Key::make(Key::Type::None);
+                if (c == 'M' || c == 'm') break;
+                params.push_back(static_cast<char>(c));
+            }
+            if (c != 'M' && c != 'm') return Key::make(Key::Type::None);
+            int pb = -1, px = -1, py = -1;
+            if (sscanf(params.c_str(), "%d;%d;%d", &pb, &px, &py) != 3)
+                return Key::make(Key::Type::None);
+            if (c == 'm') return Key::make(Key::Type::None);  // release
+            if (pb & 64) {
+                // Wheel (bit 0: 0 = up, 1 = down).
+                return Key::make((pb & 1) ? Key::Type::WheelDown
+                                          : Key::Type::WheelUp);
+            }
+            // Shifted clicks are left to the terminal (selection bypass).
+            if (pb & 4) return Key::make(Key::Type::None);
+            if ((pb & 3) != 0) return Key::make(Key::Type::None);  // non-left
+            if (px < 1 || py < 1) return Key::make(Key::Type::None);
+            Key k = Key::make(Key::Type::MousePress);
+            k.mouseCol = px;
+            k.mouseRow = py;
+            return k;
+        }
         switch (b2) {
             case 'A': return Key::make(Key::Type::ArrowUp);
             case 'B': return Key::make(Key::Type::ArrowDown);
