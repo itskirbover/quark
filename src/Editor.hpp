@@ -26,8 +26,19 @@ private:
     std::string status_;
     bool promptActive_ = false;
     std::string promptText_;
+    // Prompt doubles as quit-confirm (y/n) and save-as path entry.
+    enum class PromptMode { Quit, SaveAs };
+    PromptMode promptMode_ = PromptMode::Quit;
+    std::string promptBuf_;  // save-as path being typed
+    bool saveAsQuit_ = false;  // save-as Enter quits (came from quit flow)
     bool shouldQuit_ = false;
     bool quitSave_ = false;
+    int loopExit_ = 0;
+
+    void runEditorLoop();
+    void startQuitPrompt();
+    void startSaveAsPrompt(bool thenQuit);
+    void refreshSaveAsPrompt();
 
     void handleNormalKey(const Key& k);
     void handlePromptKey(const Key& k);

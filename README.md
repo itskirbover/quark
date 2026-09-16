@@ -22,10 +22,21 @@ Requires a C++17 compiler and CMake. No external dependencies.
 ## Usage
 
 ```sh
-./build/quark <file.md>   # opens existing file or starts a new one
+./build/quark            # main menu (logo + Open / New / Quit)
+./build/quark <file.md>  # opens existing file or starts a new one
 ```
 
 Use `test/sample.md` for testing headers, inline styles and emoji/CJK.
+
+## Main menu
+
+Without a file argument quark shows a centered menu. The `Q.png` logo
+renders via the [Kitty graphics
+protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (embedded in
+the binary at build time); other terminals get a plain `quark` title.
+Pick **Open file…** (type a path), **New untitled file**, or **Quit** with
+Up/Down + Enter, `o`/`n`/`q` shortcuts, or the mouse. Untitled buffers
+prompt for a path on `Ctrl-S` (`Save as:`).
 
 ## Keys
 

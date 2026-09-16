@@ -2,21 +2,64 @@
 
 #include <cstring>
 
+#include "Menu.hpp"
 #include "Utf8.hpp"
 
 Editor::Editor() : renderer_(nullptr) {}
+
+void Editor::startQuitPrompt() {
+    promptActive_ = true;
+    promptMode_ = PromptMode::Quit;
+    std::string name =
+        buf_.filename().empty() ? "untitled" : buf_.filename();
+    promptText_ = buf_.dirty() ? "Save changes? (" + name + ") (y/n)"
+                               : "Save file? (" + name + ") (y/n)";
+}
+
+void Editor::startSaveAsPrompt(bool thenQuit) {
+    promptActive_ = true;
+    promptMode_ = PromptMode::SaveAs;
+    promptBuf_.clear();
+    saveAsQuit_ = thenQuit;
+    refreshSaveAsPrompt();
+}
+
+void Editor::refreshSaveAsPrompt() { promptText_ = "Save as: " + promptBuf_; }
 
 int Editor::run(const std::string& path) {
     if (!path.empty()) buf_.open(path);
 
     if (!term_.enableRaw()) return 1;
 
-    // Detect Kitty sizing support BEFORE entering the alt screen so the
-    // probe spaces don't pollute the UI. Screen will be cleared right after.
+    // Detect Kitty support BEFORE entering the alt screen so the probe
+    // spaces don't pollute the UI. Screen will be cleared right after.
     kitty::detectSupport(supp_);
+    kitty::detectGraphics(supp_);
 
     term_.enterAltScreen();
     term_.enableMouse();
+
+    // No file argument: main menu (Open / New / Quit).
+    if (path.empty()) {
+        Menu menu(term_, input_, supp_);
+        MenuResult mr = menu.show();
+        if (mr.action == MenuResult::Action::Quit) {
+            term_.disableMouse();
+            term_.exitAltScreen();
+            term_.disableRaw();
+            return 0;
+        }
+        if (mr.action == MenuResult::Action::Open) buf_.open(mr.path);
+        // New: keep the fresh untitled buffer.
+        cx_ = 0;
+        cy_ = 0;
+    }
+
+    runEditorLoop();
+    return loopExit_;
+}
+
+void Editor::runEditorLoop() {
     Renderer renderer(term_, buf_, supp_);
     renderer_ = &renderer;
 
@@ -34,15 +77,15 @@ int Editor::run(const std::string& path) {
     term_.exitAltScreen();
     term_.disableRaw();
 
+    loopExit_ = 0;
     if (quitSave_) {
         if (!buf_.save()) {
             // Report failure outside alt screen.
             std::string msg = "quark: failed to save '" + buf_.filename() + "'\n";
             Terminal::writeRaw(msg);
-            return 1;
+            loopExit_ = 1;
         }
     }
-    return 0;
 }
 
 void Editor::clampCursor() {
@@ -118,14 +161,11 @@ void Editor::handleNormalKey(const Key& k) {
     switch (k.type) {
         case Key::Type::CtrlC:
             // Required quit binding: always ask to save (y/n).
-            promptActive_ = true;
-            promptText_ = buf_.dirty() ? "Save changes? "
-                                       : "Save file? ";
-            promptText_ += "(" + buf_.filename() + ")";
+            startQuitPrompt();
             break;
         case Key::Type::CtrlS:
             if (buf_.filename().empty()) {
-                status_ = "No filename (open with: quark <file.md>)";
+                startSaveAsPrompt(false);
             } else if (buf_.save()) {
                 status_ = "Saved " + buf_.filename();
             } else {
@@ -181,12 +221,48 @@ void Editor::handleNormalKey(const Key& k) {
 }
 
 void Editor::handlePromptKey(const Key& k) {
+    if (promptMode_ == PromptMode::SaveAs) {
+        if (k.type == Key::Type::Char && !k.text.empty()) {
+            promptBuf_ += k.text;
+            refreshSaveAsPrompt();
+        } else if (k.type == Key::Type::Backspace) {
+            if (!promptBuf_.empty()) {
+                promptBuf_.erase(
+                    utf8::prevCharStart(promptBuf_, promptBuf_.size()));
+            }
+            refreshSaveAsPrompt();
+        } else if (k.type == Key::Type::Enter) {
+            if (promptBuf_.empty()) {
+                promptText_ = "Type a path (or Esc to cancel)";
+            } else if (buf_.saveAs(promptBuf_)) {
+                promptActive_ = false;
+                if (saveAsQuit_) {
+                    shouldQuit_ = true;
+                    quitSave_ = false;  // already saved
+                } else {
+                    status_ = "Saved " + buf_.filename();
+                }
+            } else {
+                promptText_ = "Save failed - Save as: " + promptBuf_;
+                promptBuf_.clear();
+            }
+        } else if (k.type == Key::Type::Esc || k.type == Key::Type::CtrlC) {
+            promptActive_ = false;
+            status_ = saveAsQuit_ ? "Quit cancelled" : "Save cancelled";
+        }
+        return;
+    }
     if (k.type == Key::Type::Char && !k.text.empty()) {
         char c = k.text[0];
         if (c == 'y' || c == 'Y') {
-            promptActive_ = false;
-            shouldQuit_ = true;
-            quitSave_ = true;  // save after restoring the terminal
+            if (buf_.filename().empty()) {
+                // Untitled: need a path before quitting with save.
+                startSaveAsPrompt(true);
+            } else {
+                promptActive_ = false;
+                shouldQuit_ = true;
+                quitSave_ = true;  // save after restoring the terminal
+            }
         } else if (c == 'n' || c == 'N') {
             promptActive_ = false;
             shouldQuit_ = true;

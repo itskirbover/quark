@@ -950,7 +950,9 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
     term_.writeStr(cup(rows, 1));
     term_.writeStr("\x1b[2K");
     if (promptActive) {
-        std::string bar = promptText + " (y/n)";
+        // promptText is fully formed by the caller (quit confirm includes
+        // "(y/n)"; save-as shows the path being typed).
+        std::string bar = promptText;
         if (bar.size() > static_cast<size_t>(cols)) {
             size_t cut = cols;
             while (cut > 0 &&
@@ -1036,7 +1038,7 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
     }
 
     if (promptActive) {
-        term_.writeStr(cup(rows, (int)promptText.size() + 7));
+        term_.writeStr(cup(rows, (int)promptText.size() + 1));
         term_.showCursor();
     } else if (cursorPlaced) {
         term_.writeStr(cup((int)cursorScreenRow + 1, (int)cursorScreenCol));

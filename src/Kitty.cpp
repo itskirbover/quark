@@ -35,6 +35,31 @@ std::string sized(const std::string& text, int s, int w, int n, int d, int v,
 
 namespace {
 
+// Base64 (standard alphabet) for the graphics protocol payload.
+std::string base64Encode(const unsigned char* data, size_t len) {
+    static const char kTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned n = static_cast<unsigned>(data[i]) << 16;
+        size_t chunk = 1;
+        if (i + 1 < len) {
+            n |= static_cast<unsigned>(data[i + 1]) << 8;
+            chunk = 2;
+        }
+        if (i + 2 < len) {
+            n |= data[i + 2];
+            chunk = 3;
+        }
+        out.push_back(kTable[(n >> 18) & 63]);
+        out.push_back(kTable[(n >> 12) & 63]);
+        out.push_back(chunk >= 2 ? kTable[(n >> 6) & 63] : '=');
+        out.push_back(chunk >= 3 ? kTable[n & 63] : '=');
+    }
+    return out;
+}
+
 void writeAll(const std::string& s) {
     size_t off = 0;
     while (off < s.size()) {
@@ -110,6 +135,98 @@ bool detectSupport(KittySupport& out) {
     int d2 = cols[2] - cols[1];
     out.width = (d1 == 2);
     out.scale = (d2 == 2);
+    return true;
+}
+
+std::string transmitPng(const unsigned char* png, size_t len, int id) {
+    if (png == nullptr || len == 0) return "";
+    std::string b64 = base64Encode(png, len);
+    std::string out;
+    size_t pos = 0;
+    while (pos < b64.size()) {
+        size_t n = std::min<size_t>(4096, b64.size() - pos);
+        bool last = (pos + n >= b64.size());
+        // a=t stores only — never displays (display is an explicit a=p at
+        // the target cursor position, so no ghost copy appears at 1,1).
+        out += "\x1b_Ga=t,f=100,i=" + std::to_string(id) +
+               ",m=" + (last ? "0" : "1") +
+               ",q=2;" + b64.substr(pos, n) + "\x1b\\";
+        pos += n;
+    }
+    return out;
+}
+
+std::string displayImage(int id, int c, int r) {
+    if (c < 1) c = 1;
+    if (r < 1) r = 1;
+    return "\x1b_Ga=p,i=" + std::to_string(id) + ",c=" +
+           std::to_string(c) + ",r=" + std::to_string(r) +
+           ",q=2\x1b\\";
+}
+
+std::string deleteImage(int id) {
+    return "\x1b_Ga=d,d=i,i=" + std::to_string(id) + ",q=2\x1b\\";
+}
+
+bool cellSizePx(int& w, int& h) {
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return false;
+    // xterm window op: reply is CSI 6 ; <height> ; <width> t.
+    writeAll("\x1b[16t");
+    fflush(stdout);
+    std::string buf;
+    for (int waited = 0; waited < 250; waited += 20) {
+        int c = readByteMs(20);
+        if (c == -1) continue;
+        buf.push_back(static_cast<char>(c));
+        size_t esc = buf.find("\x1b[");
+        if (esc == std::string::npos) {
+            if (buf.size() > 32) buf.erase(0, buf.size() - 32);
+            continue;
+        }
+        size_t t = buf.find('t', esc);
+        if (t == std::string::npos) continue;
+        int a = 0, ph = 0, pw = 0;
+        if (sscanf(buf.c_str() + esc, "\x1b[%d;%d;%dt", &a, &ph, &pw) == 3 &&
+            a == 6 && ph > 0 && pw > 0 && ph < 500 && pw < 500) {
+            w = pw;
+            h = ph;
+            return true;
+        }
+        buf.erase(0, t + 1);
+    }
+    return false;
+}
+
+bool detectGraphics(KittySupport& out) {
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+        out.graphics = false;
+        return false;
+    }
+    // 1x1 black RGB pixel; expect an APC "OK" reply. Fixed id, deleted after.
+    const int kProbeId = 99;
+    std::string probe = "\x1b_Ga=t,t=d,f=24,s=1,v=1,i=" +
+                        std::to_string(kProbeId) + ";AAAA\x1b\\";
+    writeAll(probe);
+    fflush(stdout);
+    std::string buf;
+    bool ok = false;
+    for (int waited = 0; waited < 300 && !ok; waited += 20) {
+        int c = readByteMs(20);
+        if (c == -1) continue;
+        buf.push_back(static_cast<char>(c));
+        if (buf.find("OK") != std::string::npos &&
+            buf.find("_G") != std::string::npos) {
+            ok = true;
+        }
+        if (buf.size() > 256) buf.erase(0, buf.size() - 256);
+    }
+    // Best-effort cleanup of the probe image; quiet so nothing comes back.
+    writeAll(deleteImage(kProbeId));
+    fflush(stdout);
+    for (int i = 0; i < 5; ++i) {
+        if (readByteMs(10) == -1) break;
+    }
+    out.graphics = ok;
     return true;
 }
 

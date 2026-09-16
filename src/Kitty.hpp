@@ -6,8 +6,9 @@
 #include <string>
 
 struct KittySupport {
-    bool width = false;  // terminal honors w=
-    bool scale = false;  // terminal honors s= / n:d
+    bool width = false;    // terminal honors w=
+    bool scale = false;    // terminal honors s= / n:d
+    bool graphics = false;  // terminal answers the graphics (image) protocol
     bool any() const { return width || scale; }
 };
 
@@ -23,6 +24,26 @@ std::string sized(const std::string& text, int s = 1, int w = 0, int n = 0,
 // screen except the probe spaces (caller should clear afterwards).
 // Returns true if detection completed (support fields valid).
 bool detectSupport(KittySupport& out);
+
+// Query the terminal for its character cell size in pixels (CSI 16 t).
+// Same TTY-in-raw-mode requirement as above. On success sets w/h and
+// returns true; otherwise returns false (caller should assume ~9x18).
+bool cellSizePx(int& w, int& h);
+
+// Probe the Kitty graphics (image) protocol with a 1x1 test transmission.
+// Same TTY-in-raw-mode requirement as detectSupport. Sets out.graphics;
+// preserves the width/scale fields. Returns true if the probe completed.
+bool detectGraphics(KittySupport& out);
+
+// Transmit raw PNG bytes as image id. Chunked base64 (q=2: no replies).
+// Returns the APC sequence(s); empty if png is empty.
+std::string transmitPng(const unsigned char* png, size_t len, int id);
+
+// Display image id scaled to c columns x r rows at the cursor.
+std::string displayImage(int id, int c, int r);
+
+// Delete image id from terminal memory.
+std::string deleteImage(int id);
 
 }  // namespace kitty
 

@@ -13,9 +13,9 @@ cmake --build build -j
 
 ## Source map (only these build)
 
-`CMakeLists.txt` compiles 8 files in `src/`: `main, Terminal, Input, Buffer, Markdown, Kitty, Renderer, Editor` (+ `Utf8.hpp` header-only).
-- `src/term/`, `src/md/`, `src/ui/` are untracked/empty experiments — ignore.
-- Flow: `main → Editor::run` (loop/cursor/save-prompt) → `Renderer::draw` (Markdown styling + Kitty sizing + status bar) on `Terminal` (raw/alt-screen/mouse).
+`CMakeLists.txt` compiles 9 files in `src/`: `main, Terminal, Input, Buffer, Markdown, Kitty, Renderer, Editor, Menu` (+ `Utf8.hpp` header-only, + generated `build/gen/QuarkLogo.hpp` from `src/ui/Q.png` via pure-CMake hex embed).
+- `src/term/`, `src/md/` are untracked/empty experiments — ignore. `src/ui/` holds only the menu logo PNGs (not code).
+- Flow: `main → Editor::run` (menu if no path → loop/cursor/save-prompt) → `Renderer::draw` (Markdown styling + Kitty sizing + status bar) on `Terminal` (raw/alt-screen/mouse). Menu draws directly on `Terminal`, never via `Renderer`.
 
 ## Conventions agents miss
 
