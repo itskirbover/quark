@@ -278,12 +278,8 @@ std::string spanSgr(const Span& s) {
 }
 
 const char* headerSgr(int level) {
-    switch (level) {
-        case 1: return sgr::kH1;
-        case 2: return sgr::kH2;
-        case 3: return sgr::kH3;
-        case 4: return sgr::kH4;
-        case 5: return sgr::kH5;
-        default: return sgr::kH6;
-    }
+    (void)level;
+    // Headings are bold but never colored; color hurt readability and
+    // was never wanted. Sizing (Kitty) carries the hierarchy instead.
+    return sgr::kBold;
 }

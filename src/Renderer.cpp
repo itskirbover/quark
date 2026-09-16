@@ -11,6 +11,29 @@
 
 namespace {
 
+// Split a header marker (indent + '#' run + one separator) so only the
+// '#' run gets Kitty scaling; indent and the separator stay 1-cell.
+struct MarkerParts {
+    size_t hstart = 0;  // first '#'
+    size_t hend = 0;    // one past last '#'
+    size_t msize = 0;   // marker byte length clamped to line
+};
+
+MarkerParts splitHeaderMarker(const std::string& line, size_t markerLen) {
+    MarkerParts m;
+    m.msize = std::min(markerLen, line.size());
+    m.hstart = m.msize;
+    for (size_t i = 0; i < m.msize; ++i) {
+        if (line[i] == '#') {
+            m.hstart = i;
+            break;
+        }
+    }
+    m.hend = m.hstart;
+    while (m.hend < m.msize && line[m.hend] == '#') ++m.hend;
+    return m;
+}
+
 // Display cells of line[from,to) with tab stops every 8.
 size_t cellsBefore(const std::string& line, size_t from, size_t to) {
     size_t col = 0;
@@ -156,13 +179,12 @@ std::string truncateCells(const std::string& s, size_t maxCells) {
     return s.substr(0, i);
 }
 
-// Terminal rows a logical line occupies: marker own-row (H1-H3, scaled)
-// plus content rows.
+// Terminal rows a logical line occupies. Headers are single-row: the `#`
+// marker renders inline (same size as the text), never on its own row.
 int blockRows(const ParsedLine& p, bool scaled) {
     int rows = 1;
     if (scaled) {
         rows = headerStyle(p).rows;
-        if (p.headerLevel >= 1 && p.headerLevel <= 3) rows += 1;
     }
     return rows;
 }
@@ -516,10 +538,8 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
     for (size_t y = topLine_; y < n; ++y) {
         const std::string& line = buf_.line(y);
         ParsedLine p = parseLine(line, inFence);
-        int mrows =
-            (supp_.scale && p.headerLevel >= 1 && p.headerLevel <= 3) ? 1 : 0;
         HeaderStyle hs = supp_.scale ? headerStyle(p) : HeaderStyle{};
-        int total = mrows + hs.rows;
+        int total = hs.rows;
         if (target < screenRow || target >= screenRow + total) {
             screenRow += total;
             continue;
@@ -530,30 +550,131 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
                           p.block == BlockType::CodeFence ||
                           p.block == BlockType::CodeBlock ||
                           p.block == BlockType::HRule);
-        if (!plainKind && mrows > 0 && target == screenRow) {
-            outCx = 0;  // marker own-row: edit from line start
-            return true;
-        }
-        size_t markerCells = 0;
-        size_t cs = 0;
-        if (!plainKind && !p.marker.empty()) {
-            markerCells = cellsBefore(line, 0, p.marker.size());
-            cs = p.contentStart;
-        }
-        bool hasCursor = (y == curCy);
-        auto skip0 = skipRangesFor(p.spans, p.conceal, hasCursor,
-                                   hasCursor ? curCx : 0);
+        // Header `#` markers are hidden unless the cursor is on the line.
+        bool isHeader = p.headerLevel >= 1;
+        bool lineCursor = (y == curCy);
+        bool showMarker = !plainKind && !p.marker.empty() &&
+                          (!isHeader || lineCursor);
         int packN = 0, packD = 0;
         bool sized = supp_.scale && hs.s > 1;
         if (sized && hs.n > 0 && hs.d > hs.n) {
             packN = hs.n;
             packD = hs.d;
         }
+        // Mirror of draw(): only the '#' run is scaled; separator is 1-cell.
+        MarkerParts cmp;
+        std::string chash;
+        std::vector<Segment> chashSegs;
+        size_t cIndent = 0, cHashAdv = 0;
+        bool csizedHashes =
+            showMarker && isHeader && sized && !plainKind;
+        size_t markerCells = 0;
+        size_t cs = 0;
+        if (!plainKind && !p.marker.empty()) {
+            cs = p.contentStart;
+            if (csizedHashes) {
+                cmp = splitHeaderMarker(line, p.marker.size());
+                chash =
+                    line.substr(cmp.hstart, cmp.hend - cmp.hstart);
+                chashSegs =
+                    layoutContent(chash, 0, {}, {}, packN, packD);
+                cIndent = cellsBefore(line, 0, cmp.hstart);
+                for (const auto& g : chashSegs) {
+                    if (g.w > 0) {
+                        cHashAdv +=
+                            static_cast<size_t>(hs.s * g.w);
+                    } else {
+                        size_t k = g.start;
+                        while (k < g.end) {
+                            auto [cp, len] = utf8::decode(chash, k);
+                            if (len == 0) break;
+                            cHashAdv += static_cast<size_t>(
+                                hs.s * utf8::charWidth(cp));
+                            k += len;
+                        }
+                    }
+                }
+                markerCells = cIndent + cHashAdv +
+                              cellsBefore(line, cmp.hend, cmp.msize);
+            } else if (showMarker) {
+                markerCells = cellsBefore(line, 0, p.marker.size());
+            }
+        }
+        bool hasCursor = (y == curCy);
+        auto skip0 = skipRangesFor(p.spans, p.conceal, hasCursor,
+                                   hasCursor ? curCx : 0);
         std::vector<Span> useSpans = plainKind ? std::vector<Span>{} : p.spans;
         auto segs = layoutContent(line, cs, useSpans, skip0, packN, packD);
         int s = sized ? hs.s : 1;
         long rel = static_cast<long>(sx - 1) - static_cast<long>(markerCells);
         if (rel < 0) {
+            if (csizedHashes) {
+                // Region-aware walk: unsized indent, scaled '#' run,
+                // unsized separator.
+                long r = rel + static_cast<long>(markerCells);
+                if (r < static_cast<long>(cIndent)) {
+                    size_t k = 0, col = 0;
+                    while (k < cmp.hstart) {
+                        auto [cp, len] = utf8::decode(line, k);
+                        if (len == 0) break;
+                        size_t gad =
+                            (cp == '\t')
+                                ? ((col / 8 + 1) * 8 - col)
+                                : static_cast<size_t>(
+                                      utf8::charWidth(cp));
+                        if (r < static_cast<long>(col + gad)) break;
+                        col += gad;
+                        k += len;
+                    }
+                    outCx = k;
+                    return true;
+                }
+                long hr = r - static_cast<long>(cIndent);
+                size_t acc = 0;
+                for (const auto& g : chashSegs) {
+                    size_t segAdv = 0;
+                    if (g.w > 0) {
+                        segAdv = static_cast<size_t>(hs.s * g.w);
+                    } else {
+                        size_t k = g.start;
+                        while (k < g.end) {
+                            auto [cp, len] = utf8::decode(chash, k);
+                            if (len == 0) break;
+                            segAdv += static_cast<size_t>(
+                                hs.s * utf8::charWidth(cp));
+                            k += len;
+                        }
+                    }
+                    if (hr < static_cast<long>(acc + segAdv)) {
+                        int c = g.chars > 0 ? g.chars : 1;
+                        size_t idx =
+                            (static_cast<size_t>(hr) - acc) *
+                                static_cast<size_t>(c) /
+                            (segAdv >= 1 ? segAdv : 1);
+                        if (idx >= static_cast<size_t>(c))
+                            idx = static_cast<size_t>(c) - 1;
+                        outCx = cmp.hstart + g.start + idx;
+                        if (outCx > cmp.hend) outCx = cmp.hend;
+                        return true;
+                    }
+                    acc += segAdv;
+                }
+                // Separator: walk unsized bytes from cmp.hend.
+                size_t k = cmp.hend, col = cIndent + cHashAdv;
+                while (k < cmp.msize) {
+                    auto [cp, len] = utf8::decode(line, k);
+                    if (len == 0) break;
+                    size_t gad =
+                        (cp == '\t')
+                            ? ((col / 8 + 1) * 8 - col)
+                            : static_cast<size_t>(utf8::charWidth(cp));
+                    if (r < static_cast<long>(col + gad)) break;
+                    col += gad;
+                    k += len;
+                }
+                outCx = k;
+                return true;
+            }
             // Inside the inline marker: walk marker bytes at s = 1.
             size_t k = 0;
             size_t col = 0;
@@ -658,10 +779,7 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
         const std::string& line = buf_.line(y);
         ParsedLine p = parseLine(line, inFence);
         HeaderStyle hs = supp_.scale ? headerStyle(p) : HeaderStyle{};
-        int mrows = (supp_.scale && p.headerLevel >= 1 && p.headerLevel <= 3)
-                        ? 1
-                        : 0;
-        int sc = mrows + hs.rows;
+        int sc = hs.rows;
         if (screenRow + sc > viewRows) break;  // never draw partial blocks
         term_.writeStr(cup(screenRow + 1, 1));
         term_.writeStr("\x1b[2K");  // erase stale multicells on this row
@@ -679,19 +797,82 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
             term_.writeStr(line);
             term_.writeStr(sgr::kReset);
         } else {
-            // Marker: own row above the content for H1-H3 (their glyphs are
-            // taller), inline dimmed marker otherwise.
+            // Header `#` markers are concealed unless the cursor is on the
+            // line (like inline `**`/`*`/backtick markers). All other block
+            // markers (`>`, `-`, `1.`) stay dimmed inline. A revealed header
+            // marker renders inline at the same Kitty scale as its text.
+            bool hasCursor = (y == cy) && !promptActive;
+            bool isHeader = p.headerLevel >= 1;
+            bool showMarker =
+                !p.marker.empty() && (!isHeader || hasCursor);
+            bool sized = supp_.scale && hs.s > 1;
+            int packN = (sized && hs.n > 0 && hs.d > hs.n) ? hs.n : 0;
+            int packD = (sized && hs.n > 0 && hs.d > hs.n) ? hs.d : 0;
+            // Sized-header marker pieces: only the '#' run is scaled; the
+            // separator space stays 1 cell so `## Text` keeps a normal gap.
+            // (Kept in scope for the cursor-advance math below.)
+            MarkerParts mp;
+            std::string hashText;
+            std::vector<Segment> hashSegs;
+            size_t indentCells = 0, hashAdv = 0, sepCells = 0;
             size_t markerCells = 0;
-            if (!p.marker.empty()) {
+            bool sizedHashes = showMarker && isHeader && sized;
+            if (sizedHashes) {
+                mp = splitHeaderMarker(line, p.marker.size());
+                hashText = line.substr(mp.hstart, mp.hend - mp.hstart);
+                hashSegs =
+                    layoutContent(hashText, 0, {}, {}, packN, packD);
+                indentCells = cellsBefore(line, 0, mp.hstart);
+                for (const auto& g : hashSegs) {
+                    if (g.w > 0) {
+                        hashAdv += static_cast<size_t>(hs.s * g.w);
+                    } else {
+                        size_t k = g.start;
+                        while (k < g.end) {
+                            auto [cp, len] =
+                                utf8::decode(hashText, k);
+                            if (len == 0) break;
+                            hashAdv += static_cast<size_t>(
+                                hs.s * utf8::charWidth(cp));
+                            k += len;
+                        }
+                    }
+                }
+                sepCells = cellsBefore(line, mp.hend, mp.msize);
+                markerCells = indentCells + hashAdv + sepCells;
+            } else if (showMarker) {
+                markerCells = cellsBefore(line, 0, p.marker.size());
+            }
+            if (sizedHashes) {
+                std::string mout;
+                mout += sgr::kDim;
+                mout += line.substr(0, mp.hstart);  // indent, unsized
+                for (const auto& g : hashSegs) {
+                    std::string chunk =
+                        hashText.substr(g.start, g.end - g.start);
+                    if (g.w == 0) {
+                        size_t pos = 0;
+                        while (pos < chunk.size()) {
+                            size_t nn = std::min<size_t>(
+                                3000, chunk.size() - pos);
+                            mout += kitty::sized(chunk.substr(pos, nn),
+                                                 hs.s, 0, hs.n, hs.d,
+                                                 hs.v, hs.h);
+                            pos += nn;
+                        }
+                    } else {
+                        int w = g.w > 7 ? 7 : g.w;
+                        mout += kitty::sized(chunk, hs.s, w, hs.n, hs.d,
+                                             hs.v, hs.h);
+                    }
+                }
+                mout += line.substr(mp.hend, mp.msize - mp.hend);  // separator
+                mout += sgr::kReset;
+                term_.writeStr(mout);
+            } else if (showMarker) {
                 term_.writeStr(sgr::kDim);
                 term_.writeStr(p.marker);
                 term_.writeStr(sgr::kReset);
-                markerCells = cellsBefore(line, 0, p.marker.size());
-            }
-            if (mrows > 0) {
-                ++screenRow;
-                term_.writeStr(cup(screenRow + 1, 1));
-                term_.writeStr("\x1b[2K");
             }
             std::string base;
             if (p.headerLevel >= 1) base = headerSgr(p.headerLevel);
@@ -704,7 +885,7 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
             }
             // Span-level reveal: hidden formatting shows raw source only
             // when the cursor is inside the formatted span's extent.
-            bool hasCursor = (y == cy) && !promptActive;
+            // (hasCursor already computed above for marker concealment.)
             auto skip0 = skipRangesFor(p.spans, p.conceal, hasCursor, cx);
             LineLayout lay = layoutLine(line, p.contentStart, p.spans, skip0,
                                         hs, markerCells);
@@ -712,8 +893,21 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
 
             if (hasCursor) {
                 size_t colCells;
-                if (cx < p.contentStart) {
+                if (cx < p.contentStart && sizedHashes) {
+                    if (cx <= mp.hstart) {
+                        colCells = cellsBefore(line, 0, cx);
+                    } else if (cx < mp.hend) {
+                        colCells = indentCells +
+                                   advanceUpTo(hashText, hashSegs, hs.s,
+                                               true, 0, cx - mp.hstart);
+                    } else {
+                        colCells = indentCells + hashAdv +
+                                   cellsBefore(line, mp.hend, cx);
+                    }
+                } else if (cx < p.contentStart && showMarker) {
                     colCells = cellsBefore(line, 0, cx);
+                } else if (cx < p.contentStart) {
+                    colCells = 0;  // hidden `#`: pin to content origin
                 } else {
                     // Advance shared with emission; map original offsets
                     // through tab expansion (tabs use absolute 8-stops).
@@ -741,7 +935,7 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
             cursorScreenCol = c;
             cursorPlaced = true;
         }
-        screenRow += hs.rows;  // marker row (if any) counted inline
+        screenRow += hs.rows;
     }
     // Filler tilde rows.
     for (int r = screenRow; r < viewRows; ++r) {

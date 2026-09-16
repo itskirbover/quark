@@ -11,22 +11,22 @@ Outside kitty it degrades to SGR-only styling (status bar shows `plain`).
 
 | Level | Rows | Sizing | Look |
 |-------|------|--------|------|
-| `#` | 2 + marker row | `s=2` | 2× glyphs |
-| `##` | 2 + marker row | `s=2:n=3:d=4:v=2` + packed `w` | ~1.5×, tight, centered |
-| `###` | 2 + marker row | `s=2:n=1:d=2:v=2` + packed `w` | 1×, tight, centered |
-| `####` / `#####` / `######` | 1 | none | normal size, bold + color |
+| `#` | 2 | `s=2` | 2× glyphs |
+| `##` | 2 | `s=2:n=3:d=4:v=2` + packed `w` | ~1.5×, tight, centered |
+| `###` | 2 | `s=2:n=1:d=2:v=2` + packed `w` | 1×, tight, centered |
+| `####` / `#####` / `######` | 1 | none | normal size, bold |
 
-All levels keep SGR bold + a per-level color. H1–H3 draw their `#` marker
-dimmed on its own row (same size mismatch would look broken inline); H4–H6
-keep inline markers. Fractional H2/H3 pack characters into explicit-`w`
+All levels are SGR bold with no color. The `#` marker renders inline at
+the same size as its text. Fractional H2/H3 pack characters into explicit-`w`
 groups so the advance matches the shrunken glyphs (no letter-spacing gaps).
 
 ## Concealed markers
 
 Inline markers (`**`, `*`, `_`, `~~`, backticks, `[`…`](url)`) are hidden
 except inside the formatted span under the cursor — move the cursor into
-`*text*` and its markers reappear for editing. Block markers (`#`, `>`,
-`-`, `1.`) stay dimmed everywhere. Inline code renders bright-on-black.
+`*text*` and its markers reappear for editing. Header `#` markers are hidden
+unless the cursor is on that line. Block markers (`>`, `-`, `1.`) stay
+dimmed everywhere. Inline code renders bright-on-black.
 Fenced code blocks render as normal body text (only the ```` ``` ````
 delimiters stay dimmed).
 
