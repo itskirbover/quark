@@ -8,11 +8,38 @@
 namespace {
 struct termios g_orig;
 bool g_haveOrig = false;
+
+std::string base64Encode(const std::string& in) {
+    static const char kTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    for (size_t i = 0; i < in.size(); i += 3) {
+        unsigned n = static_cast<unsigned char>(in[i]) << 16;
+        size_t chunk = 1;
+        if (i + 1 < in.size()) {
+            n |= static_cast<unsigned char>(in[i + 1]) << 8;
+            chunk = 2;
+        }
+        if (i + 2 < in.size()) {
+            n |= static_cast<unsigned char>(in[i + 2]);
+            chunk = 3;
+        }
+        out.push_back(kTable[(n >> 18) & 63]);
+        out.push_back(kTable[(n >> 12) & 63]);
+        out.push_back(chunk >= 2 ? kTable[(n >> 6) & 63] : '=');
+        out.push_back(chunk >= 3 ? kTable[n & 63] : '=');
+    }
+    return out;
+}
+
 }  // namespace
 
 Terminal::Terminal() { refreshSize(); }
 
 Terminal::~Terminal() {
+    disableKeyboard();
+    disablePaste();
     disableMouse();
     exitAltScreen();
     disableRaw();
@@ -54,15 +81,38 @@ void Terminal::enterAltScreen() {
 
 void Terminal::exitAltScreen() {
     if (!altActive_) return;
-    writeRaw("\x1b[?1049l");
+    // Restore the default cursor shape (DECSCUSR 0) so the bar cursor
+    // doesn't leak into the shell after quark exits.
+    writeRaw("\x1b[?1049l\x1b[0 q\x1b[?25h");
     altActive_ = false;
 }
 
 void Terminal::hideCursor() { writeRaw("\x1b[?25l"); }
-void Terminal::showCursor() { writeRaw("\x1b[?25h"); }
+// Steady bar (line) instead of the terminal default block.
+void Terminal::showCursor() { writeRaw("\x1b[6 q\x1b[?25h"); }
 
 void Terminal::enableMouse() { writeRaw("\x1b[?1000h\x1b[?1006h"); }
 void Terminal::disableMouse() { writeRaw("\x1b[?1006l\x1b[?1000l"); }
+
+void Terminal::enablePaste() { writeRaw("\x1b[?2004h"); }
+void Terminal::disablePaste() { writeRaw("\x1b[?2004l"); }
+
+void Terminal::enableKeyboard() {
+    if (kbActive_) return;
+    writeRaw("\x1b[>1u");
+    kbActive_ = true;
+}
+
+void Terminal::disableKeyboard() {
+    if (!kbActive_) return;
+    writeRaw("\x1b[<u");
+    kbActive_ = false;
+}
+
+void Terminal::copyToClipboard(const std::string& text) {
+    if (text.empty()) return;
+    writeRaw("\x1b]52;c;" + base64Encode(text) + "\x07");
+}
 
 bool Terminal::refreshSize() {
     struct winsize ws {};

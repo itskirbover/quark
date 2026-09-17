@@ -230,4 +230,42 @@ bool detectGraphics(KittySupport& out) {
     return true;
 }
 
+bool detectKeyboard(KittySupport& out) {
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+        out.keyboard = false;
+        return false;
+    }
+    // Push flag 1 (disambiguate) then query: supporting terminals reply
+    // CSI ? flags u. The push is harmless where unsupported (ignored).
+    writeAll("\x1b[>1u\x1b[?u");
+    fflush(stdout);
+    std::string buf;
+    int flags = 0;
+    bool got = false;
+    for (int waited = 0; waited < 200 && !got; waited += 20) {
+        int c = readByteMs(20);
+        if (c == -1) continue;
+        buf.push_back(static_cast<char>(c));
+        size_t esc = buf.find("\x1b[?");
+        if (esc == std::string::npos) {
+            if (buf.size() > 32) buf.erase(0, buf.size() - 32);
+            continue;
+        }
+        size_t u = buf.find('u', esc);
+        if (u == std::string::npos) continue;
+        if (sscanf(buf.c_str() + esc, "\x1b[?%du", &flags) == 1) got = true;
+        buf.erase(0, u + 1);
+    }
+    out.keyboard = got && (flags & 1) != 0;
+    // Always pop: the probe push must not linger. The editor pushes a
+    // fresh level when it enables keyboard mode. Pops without a matching
+    // push are ignored by the terminal.
+    writeAll("\x1b[<u");
+    fflush(stdout);
+    for (int i = 0; i < 5; ++i) {
+        if (readByteMs(10) == -1) break;
+    }
+    return got;
+}
+
 }  // namespace kitty

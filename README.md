@@ -43,7 +43,12 @@ prompt for a path on `Ctrl-S` (`Save as:`).
 | Key | Action |
 |-----|--------|
 | Arrows, Home/End, PgUp/PgDn | Move cursor |
-| Type, Enter, Backspace, Delete | Edit |
+| Shift+Arrows/Home/End/PgUp/PgDn | Select text |
+| Type, Enter, Backspace, Delete | Edit (typing replaces the selection) |
+| Ctrl-Backspace / Ctrl-Delete | Delete word backward / forward |
+| Ctrl-Z / Ctrl-Y | Undo / redo |
+| Ctrl-Shift-C / Alt+C | Copy selection to system clipboard (OSC 52; Ctrl-Shift-C needs a terminal that forwards it — quark auto-negotiates the Kitty keyboard protocol, works in kitty) |
+| Paste (Ctrl-Shift-V) | Insert clipboard as one undo step |
 | Left click | Move cursor (needs a mouse-reporting terminal like kitty) |
 | Mouse wheel | Move cursor ±3 lines |
 | Shift+click | Terminal text selection |

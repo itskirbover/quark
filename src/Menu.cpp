@@ -1,12 +1,10 @@
 #include "Menu.hpp"
 
-#include "QuarkLogo.hpp"
+#include "Kitty.hpp"
 #include "Terminal.hpp"
 #include "Utf8.hpp"
 
 namespace {
-
-constexpr int kImageId = 31;
 
 const char* kItems[] = {"Open file...", "New untitled file", "Quit"};
 constexpr int kItemCount = 3;
@@ -15,27 +13,9 @@ std::string cup(int row1, int col1) {
     return "\x1b[" + std::to_string(row1) + ";" + std::to_string(col1) + "H";
 }
 
-// PNG dimensions from the IHDR chunk; falls back to the known logo size.
-void logoSize(int& w, int& h) {
-    w = 118;
-    h = 118;
-    const unsigned char* b = quark_logo::bytes;
-    size_t n = quark_logo::size;
-    if (n > 24 && b[12] == 'I' && b[13] == 'H' && b[14] == 'D' &&
-        b[15] == 'R') {
-        w = (b[16] << 24) | (b[17] << 16) | (b[18] << 8) | b[19];
-        h = (b[20] << 24) | (b[21] << 16) | (b[22] << 8) | b[23];
-        if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
-            w = 118;
-            h = 118;
-        }
-    }
-}
-
 }  // namespace
 
-Menu::Menu(Terminal& term, InputReader& input, const KittySupport& supp)
-    : term_(term), input_(input), supp_(supp) {}
+Menu::Menu(Terminal& term, InputReader& input) : term_(term), input_(input) {}
 
 void Menu::activate(int idx, MenuResult& out, bool& done) {
     if (idx == 0) {
@@ -58,52 +38,26 @@ void Menu::draw() {
     term_.hideCursor();
     term_.writeStr("\x1b[H\x1b[2J");
 
-    bool graphics = supp_.graphics && quark_logo::size > 0;
-    int imgW = 0, imgH = 0;
-    logoSize(imgW, imgH);
-
-    // Logo cell footprint at NATURAL size: pixel dimensions mapped through
-    // the measured cell size, so the image is never stretched or rescaled.
-    // (Falls back to a 9x18 estimate when the terminal won't report cells.)
-    int imgCols = (imgW + cellW_ - 1) / (cellW_ > 0 ? cellW_ : 9);
-    int imgRows = (imgH + cellH_ - 1) / (cellH_ > 0 ? cellH_ : 18);
-    if (imgCols < 1) imgCols = 1;
-    if (imgRows < 1) imgRows = 1;
-
-    int logoRows = graphics ? imgRows : 2;  // ASCII title takes 2 rows
-    // Total block: logo + blank + items + blank + hint/status.
+    constexpr int logoRows = 2;  // "quark" title + subtitle
+    // Total block: title + blank + items + blank + hint/status.
     int total = logoRows + 1 + kItemCount + 2;
     int top = (rows - total) / 2;
     if (top < 1) top = 1;
 
-    // Placement for the end-of-frame display command (cursor-anchored).
-    int imgRow = -1, imgCol = -1;
-    if (graphics) {
-        // Retransmitted every frame: the menu redraws only on keypress and
-        // the per-frame full clear wipes placements, so stored images can't
-        // be relied on across frames.
-        term_.writeStr(kitty::transmitPng(quark_logo::bytes,
-                                          quark_logo::size, kImageId));
-        transmitted_ = true;
-        imgCol = (cols - imgCols) / 2 + 1;
-        if (imgCol < 1) imgCol = 1;
-        imgRow = top + 1;
-    } else {
-        std::string title = "quark";
-        int tcol = (cols - static_cast<int>(title.size())) / 2 + 1;
-        if (tcol < 1) tcol = 1;
-        term_.writeStr(cup(top + 1, tcol));
-        term_.writeStr(sgr::kBold);
-        term_.writeStr(title);
-        term_.writeStr(sgr::kReset);
-        std::string sub = "a markdown editor";
-        int scol = (cols - static_cast<int>(sub.size())) / 2 + 1;
-        if (scol < 1) scol = 1;
-        term_.writeStr(cup(top + 2, scol));
-        term_.writeStr(sgr::kDim);
-        term_.writeStr(sub);
-        term_.writeStr(sgr::kReset);
-    }
+    std::string title = "quark";
+    int tcol = (cols - static_cast<int>(title.size())) / 2 + 1;
+    if (tcol < 1) tcol = 1;
+    term_.writeStr(cup(top + 1, tcol));
+    term_.writeStr(sgr::kBold);
+    term_.writeStr(title);
+    term_.writeStr(sgr::kReset);
+    std::string sub = "a markdown editor";
+    int scol = (cols - static_cast<int>(sub.size())) / 2 + 1;
+    if (scol < 1) scol = 1;
+    term_.writeStr(cup(top + 2, scol));
+    term_.writeStr(sgr::kDim);
+    term_.writeStr(sub);
+    term_.writeStr(sgr::kReset);
 
     itemRows_.assign(kItemCount, -1);
     itemCols_.assign(kItemCount, 1);
@@ -143,12 +97,6 @@ void Menu::draw() {
         if (!status_.empty()) term_.writeStr(sgr::kBold);
         term_.writeStr(msg);
         term_.writeStr(sgr::kReset);
-        // Display the logo last: it is cursor-anchored, so placing it after
-        // all text guarantees nothing overwrites its cells afterwards.
-        if (graphics && imgRow > 0) {
-            term_.writeStr(cup(imgRow, imgCol));
-            term_.writeStr(kitty::displayImage(kImageId, imgCols, imgRows));
-        }
         term_.showCursor();
         // Park the cursor at the start of the selected label.
         term_.writeStr(cup(itemRows_[selected_], itemCols_[selected_]));
@@ -158,10 +106,6 @@ void Menu::draw() {
 MenuResult Menu::show() {
     MenuResult out;
     bool done = false;
-    // Measure cells once (pre-alt-screen probes already ran; this is inside
-    // the alt screen but the query/response is self-contained). On failure
-    // the 9x18 member defaults stand.
-    kitty::cellSizePx(cellW_, cellH_);
     while (!done) {
         draw();
         Key k = input_.readKey();
@@ -241,11 +185,6 @@ MenuResult Menu::show() {
                 break;
         }
     }
-    // Never leave the transmitted image behind in the terminal.
-    if (transmitted_) {
-        term_.writeStr(kitty::deleteImage(kImageId));
-        term_.writeStr("\x1b[H\x1b[2J");
-        transmitted_ = false;
-    }
+    term_.writeStr("\x1b[H\x1b[2J");
     return out;
 }

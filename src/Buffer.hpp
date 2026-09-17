@@ -26,6 +26,24 @@ public:
     void backspace(size_t y, size_t x, size_t& outY, size_t& outX);
     void deleteForward(size_t y, size_t x);
 
+    // Range edit for selections / undo (multi-line, '\n'-joined text).
+    // Endpoints are normalized and clamped to character boundaries.
+    std::string extractRange(size_t y0, size_t x0, size_t y1,
+                             size_t x1) const;
+    void eraseRange(size_t y0, size_t x0, size_t y1, size_t x1);
+    void insertMultiline(size_t y, size_t x, const std::string& text);
+
+    // Word motion for Ctrl+Backspace (backward) / Ctrl+Delete (forward).
+    // At a line edge the target crosses the newline (join behavior).
+    void wordStartBackward(size_t y, size_t x, size_t& outY,
+                           size_t& outX) const;
+    void wordEndForward(size_t y, size_t x, size_t& outY,
+                        size_t& outX) const;
+
+    // Full-line access for undo snapshots.
+    const std::vector<std::string>& lines() const { return lines_; }
+    void setLines(const std::vector<std::string>& l);
+
     // Clamp byte offset to a character boundary inside the line.
     size_t clampToChar(size_t y, size_t x) const;
     size_t lineEndX(size_t y) const;

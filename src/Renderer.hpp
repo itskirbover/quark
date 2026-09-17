@@ -44,6 +44,7 @@ struct LineLayout {
     std::vector<Segment> segs;
     std::vector<size_t> byteMap;  // original -> text offsets; empty = identity
     bool sized = false;
+    size_t selStart = 0, selEnd = 0;
 };
 
 class Renderer {
@@ -51,16 +52,20 @@ public:
     Renderer(Terminal& term, Buffer& buf, const KittySupport& supp);
 
     // Redraw everything. cx/cy = editing cursor (cx = byte offset).
-    // If promptActive, the status row shows promptText instead and the
-    // editing cursor is parked there.
-    void draw(size_t cx, size_t cy, const std::string& status, bool promptActive,
+    // Selection is anchor (selAx/selAy) + cursor head; highlighted when
+    // selActive and non-empty. If promptActive, the status row shows
+    // promptText instead and the editing cursor is parked there.
+    void draw(size_t cx, size_t cy, bool selActive, size_t selAx,
+              size_t selAy, const std::string& status, bool promptActive,
               const std::string& promptText);
 
     size_t topLine() const { return topLine_; }
 
     // Map 1-based screen coordinates to a buffer cursor (false = ignore:
-    // status bar, out of range). curCx/curCy drive span reveal state.
+    // status bar, out of range). curCx/curCy drive span reveal state;
+    // the selection reveals spans the same way.
     bool screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
+                         bool selActive, size_t selAx, size_t selAy,
                          size_t& outCx, size_t& outCy);
 
 private:
@@ -73,7 +78,8 @@ private:
     LineLayout layoutLine(const std::string& line, size_t contentStart,
                           const std::vector<Span>& spans,
                           const std::vector<std::pair<size_t, size_t>>& skip,
-                          const HeaderStyle& style, size_t markerCells);
+                          const HeaderStyle& style, size_t markerCells,
+                          size_t selStart, size_t selEnd);
     void emitLayout(const LineLayout& lay, const std::string& baseSgr,
                     const HeaderStyle& style);
 };

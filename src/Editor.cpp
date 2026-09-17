@@ -1,6 +1,8 @@
 #include "Editor.hpp"
 
 #include <cstring>
+#include <utility>
+#include <vector>
 
 #include "Menu.hpp"
 #include "Utf8.hpp"
@@ -35,15 +37,20 @@ int Editor::run(const std::string& path) {
     // spaces don't pollute the UI. Screen will be cleared right after.
     kitty::detectSupport(supp_);
     kitty::detectGraphics(supp_);
+    kitty::detectKeyboard(supp_);
 
     term_.enterAltScreen();
     term_.enableMouse();
+    term_.enablePaste();
+    if (supp_.keyboard) term_.enableKeyboard();
 
     // No file argument: main menu (Open / New / Quit).
     if (path.empty()) {
-        Menu menu(term_, input_, supp_);
+        Menu menu(term_, input_);
         MenuResult mr = menu.show();
         if (mr.action == MenuResult::Action::Quit) {
+            term_.disableKeyboard();
+            term_.disablePaste();
             term_.disableMouse();
             term_.exitAltScreen();
             term_.disableRaw();
@@ -64,7 +71,8 @@ void Editor::runEditorLoop() {
     renderer_ = &renderer;
 
     while (!shouldQuit_) {
-        renderer_->draw(cx_, cy_, status_, promptActive_, promptText_);
+        renderer_->draw(cx_, cy_, selecting_, ax_, ay_, status_,
+                        promptActive_, promptText_);
         status_.clear();
         Key k = input_.readKey();
         if (promptActive_)
@@ -73,6 +81,8 @@ void Editor::runEditorLoop() {
             handleNormalKey(k);
     }
 
+    term_.disableKeyboard();
+    term_.disablePaste();
     term_.disableMouse();
     term_.exitAltScreen();
     term_.disableRaw();
@@ -97,6 +107,109 @@ void Editor::clampCursor() {
     }
     if (cy_ >= n) cy_ = n - 1;
     cx_ = buf_.clampToChar(cy_, cx_);
+    if (selecting_) {
+        if (ay_ >= n) ay_ = n - 1;
+        ax_ = buf_.clampToChar(ay_, ax_);
+    }
+}
+
+void Editor::applyExtend(bool extend) {
+    if (extend) {
+        if (!selecting_) {
+            ax_ = cx_;
+            ay_ = cy_;
+            selecting_ = true;
+        }
+    } else {
+        selecting_ = false;
+    }
+    breakTyping();
+}
+
+void Editor::moveWithExtend(bool extend, void (Editor::*move)()) {
+    applyExtend(extend);
+    (this->*move)();
+}
+
+bool Editor::hasSelection() const {
+    return selecting_ && (ax_ != cx_ || ay_ != cy_);
+}
+
+void Editor::normSel(size_t& y0, size_t& x0, size_t& y1,
+                     size_t& x1) const {
+    y0 = ay_;
+    x0 = buf_.clampToChar(ay_, ax_);
+    y1 = cy_;
+    x1 = buf_.clampToChar(cy_, cx_);
+    if (y1 < y0 || (y1 == y0 && x1 < x0)) {
+        std::swap(y0, y1);
+        std::swap(x0, x1);
+    }
+}
+
+void Editor::clearSelection() { selecting_ = false; }
+
+bool Editor::eraseSelection() {
+    if (!hasSelection()) return false;
+    size_t y0, x0, y1, x1;
+    normSel(y0, x0, y1, x1);
+    buf_.eraseRange(y0, x0, y1, x1);
+    cy_ = y0;
+    cx_ = x0;
+    selecting_ = false;
+    clampCursor();
+    return true;
+}
+
+void Editor::pushHistory(bool coalesceTyping) {
+    if (coalesceTyping && typingActive_) return;
+    HistState s{buf_.lines(), cx_, cy_, ax_, ay_, selecting_};
+    undo_.push_back(std::move(s));
+    if (undo_.size() > 200) undo_.erase(undo_.begin());
+    redo_.clear();
+    typingActive_ = coalesceTyping;
+}
+
+void Editor::breakTyping() { typingActive_ = false; }
+
+void Editor::doUndo() {
+    typingActive_ = false;
+    if (undo_.empty()) {
+        status_ = "Nothing to undo";
+        return;
+    }
+    HistState cur{buf_.lines(), cx_, cy_, ax_, ay_, selecting_};
+    redo_.push_back(std::move(cur));
+    if (redo_.size() > 200) redo_.erase(redo_.begin());
+    HistState s = std::move(undo_.back());
+    undo_.pop_back();
+    buf_.setLines(s.lines);
+    cx_ = s.cx;
+    cy_ = s.cy;
+    ax_ = s.ax;
+    ay_ = s.ay;
+    selecting_ = s.selecting;
+    clampCursor();
+}
+
+void Editor::doRedo() {
+    typingActive_ = false;
+    if (redo_.empty()) {
+        status_ = "Nothing to redo";
+        return;
+    }
+    HistState cur{buf_.lines(), cx_, cy_, ax_, ay_, selecting_};
+    undo_.push_back(std::move(cur));
+    if (undo_.size() > 200) undo_.erase(undo_.begin());
+    HistState s = std::move(redo_.back());
+    redo_.pop_back();
+    buf_.setLines(s.lines);
+    cx_ = s.cx;
+    cy_ = s.cy;
+    ax_ = s.ax;
+    ay_ = s.ay;
+    selecting_ = s.selecting;
+    clampCursor();
 }
 
 void Editor::moveLeft() {
@@ -161,10 +274,14 @@ void Editor::handleNormalKey(const Key& k) {
     switch (k.type) {
         case Key::Type::CtrlC:
             // Required quit binding: always ask to save (y/n).
+            breakTyping();
+            clearSelection();
             startQuitPrompt();
             break;
         case Key::Type::CtrlS:
+            breakTyping();
             if (buf_.filename().empty()) {
+                clearSelection();
                 startSaveAsPrompt(false);
             } else if (buf_.save()) {
                 status_ = "Saved " + buf_.filename();
@@ -172,48 +289,169 @@ void Editor::handleNormalKey(const Key& k) {
                 status_ = "Save failed: " + std::string(strerror(errno));
             }
             break;
-        case Key::Type::ArrowLeft: moveLeft(); break;
-        case Key::Type::ArrowRight: moveRight(); break;
-        case Key::Type::ArrowUp: moveUp(); break;
-        case Key::Type::ArrowDown: moveDown(); break;
-        case Key::Type::Home: cx_ = 0; break;
-        case Key::Type::End: cx_ = buf_.lineEndX(cy_); break;
-        case Key::Type::PageUp: pageUp(); break;
-        case Key::Type::PageDown: pageDown(); break;
+        case Key::Type::CtrlZ:
+            doUndo();
+            break;
+        case Key::Type::CtrlY:
+            doRedo();
+            break;
+        case Key::Type::Copy: {
+            if (!hasSelection()) {
+                status_ = "Nothing to copy";
+                break;
+            }
+            size_t y0, x0, y1, x1;
+            normSel(y0, x0, y1, x1);
+            std::string text = buf_.extractRange(y0, x0, y1, x1);
+            if (text.size() > 1024 * 1024) {
+                status_ = "Selection too large to copy";
+                break;
+            }
+            Terminal::copyToClipboard(text);
+            size_t chars = utf8::charCount(text);
+            status_ = "Copied " + std::to_string(chars) +
+                      (chars == 1 ? " char" : " chars");
+            break;
+        }
+        case Key::Type::Paste: {
+            if (k.text.empty()) break;
+            pushHistory(false);
+            eraseSelection();
+            buf_.insertMultiline(cy_, cx_, k.text);
+            size_t nl = 0;
+            size_t lastLen = cx_;
+            for (char c : k.text) {
+                if (c == '\n') {
+                    ++nl;
+                    lastLen = 0;
+                } else {
+                    ++lastLen;
+                }
+            }
+            cy_ += nl;
+            cx_ = lastLen;
+            size_t chars = utf8::charCount(k.text);
+            status_ = "Pasted " + std::to_string(chars) +
+                      (chars == 1 ? " char" : " chars");
+            break;
+        }
+        case Key::Type::ArrowLeft:
+            moveWithExtend(k.shift, &Editor::moveLeft);
+            break;
+        case Key::Type::ArrowRight:
+            moveWithExtend(k.shift, &Editor::moveRight);
+            break;
+        case Key::Type::ArrowUp: moveWithExtend(k.shift, &Editor::moveUp); break;
+        case Key::Type::ArrowDown:
+            moveWithExtend(k.shift, &Editor::moveDown);
+            break;
+        case Key::Type::Home:
+            applyExtend(k.shift);
+            cx_ = 0;
+            break;
+        case Key::Type::End:
+            applyExtend(k.shift);
+            cx_ = buf_.lineEndX(cy_);
+            break;
+        case Key::Type::PageUp:
+            applyExtend(k.shift);
+            pageUp();
+            break;
+        case Key::Type::PageDown:
+            applyExtend(k.shift);
+            pageDown();
+            break;
         case Key::Type::Enter:
+            pushHistory(false);
+            eraseSelection();
             buf_.insertNewline(cy_, cx_);
             ++cy_;
             cx_ = 0;
             break;
-        case Key::Type::Backspace: {
-            size_t ny = cy_, nx = cx_;
-            buf_.backspace(cy_, cx_, ny, nx);
-            cy_ = ny;
-            cx_ = nx;
-            break;
-        }
-        case Key::Type::Delete: buf_.deleteForward(cy_, cx_); break;
-        case Key::Type::MousePress: {
-            size_t nx = cx_, ny = cy_;
-            if (renderer_ &&
-                renderer_->screenToLogical(k.mouseCol, k.mouseRow, cx_, cy_,
-                                           nx, ny)) {
+        case Key::Type::Backspace:
+            if (hasSelection()) {
+                pushHistory(false);
+                eraseSelection();
+            } else if (cx_ == 0 && cy_ == 0) {
+                break;  // nothing to delete
+            } else {
+                pushHistory(false);
+                size_t ny = cy_, nx = cx_;
+                buf_.backspace(cy_, cx_, ny, nx);
                 cy_ = ny;
                 cx_ = nx;
             }
             break;
+        case Key::Type::CtrlBackspace:
+            if (hasSelection()) {
+                pushHistory(false);
+                eraseSelection();
+            } else {
+                size_t wy = cy_, wx = cx_;
+                buf_.wordStartBackward(cy_, cx_, wy, wx);
+                if (wy == cy_ && wx == cx_) break;  // nothing to delete
+                pushHistory(false);
+                buf_.eraseRange(wy, wx, cy_, cx_);
+                cy_ = wy;
+                cx_ = wx;
+            }
+            break;
+        case Key::Type::Delete:
+            if (hasSelection()) {
+                pushHistory(false);
+                eraseSelection();
+            } else if (cx_ >= buf_.lineLen(cy_) &&
+                       cy_ + 1 >= buf_.lineCount()) {
+                break;  // nothing to delete
+            } else {
+                pushHistory(false);
+                buf_.deleteForward(cy_, cx_);
+            }
+            break;
+        case Key::Type::CtrlDelete:
+            if (hasSelection()) {
+                pushHistory(false);
+                eraseSelection();
+            } else {
+                size_t wy = cy_, wx = cx_;
+                buf_.wordEndForward(cy_, cx_, wy, wx);
+                if (wy == cy_ && wx == cx_) break;  // nothing to delete
+                pushHistory(false);
+                buf_.eraseRange(cy_, cx_, wy, wx);
+            }
+            break;
+        case Key::Type::MousePress: {
+            breakTyping();
+            size_t nx = cx_, ny = cy_;
+            if (renderer_ && renderer_->screenToLogical(
+                                 k.mouseCol, k.mouseRow, cx_, cy_,
+                                 selecting_, ax_, ay_, nx, ny)) {
+                cy_ = ny;
+                cx_ = nx;
+            }
+            clearSelection();
+            break;
         }
         case Key::Type::WheelUp:
+            selecting_ = false;
+            breakTyping();
             for (int i = 0; i < 3; ++i) moveUp();
             break;
         case Key::Type::WheelDown:
+            selecting_ = false;
+            breakTyping();
             for (int i = 0; i < 3; ++i) moveDown();
             break;
         case Key::Type::Char:
+            pushHistory(true);
+            eraseSelection();
             buf_.insertText(cy_, cx_, k.text);
             cx_ += k.text.size();
             break;
         case Key::Type::Esc:
+            clearSelection();
+            breakTyping();
+            break;
         case Key::Type::None:
             break;
     }
@@ -224,6 +462,11 @@ void Editor::handlePromptKey(const Key& k) {
     if (promptMode_ == PromptMode::SaveAs) {
         if (k.type == Key::Type::Char && !k.text.empty()) {
             promptBuf_ += k.text;
+            refreshSaveAsPrompt();
+        } else if (k.type == Key::Type::Paste && !k.text.empty()) {
+            for (char c : k.text) {
+                if (c != '\n') promptBuf_ += c;
+            }
             refreshSaveAsPrompt();
         } else if (k.type == Key::Type::Backspace) {
             if (!promptBuf_.empty()) {

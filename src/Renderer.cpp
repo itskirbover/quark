@@ -143,6 +143,15 @@ std::string styleSgr(const Style& st) {
     return out;
 }
 
+// Plain line with byte range [a,b) reverse-highlighted. Endpoints must
+// already be clamped to character boundaries.
+std::string highlightPlain(const std::string& line, size_t a, size_t b) {
+    if (a >= b || a >= line.size()) return line;
+    if (b > line.size()) b = line.size();
+    return line.substr(0, a) + sgr::kReverse + line.substr(a, b - a) +
+           "\x1b[27m" + line.substr(b);
+}
+
 std::string cup(int row1, int col1) {
     return "\x1b[" + std::to_string(row1) + ";" + std::to_string(col1) + "H";
 }
@@ -204,20 +213,25 @@ std::vector<std::pair<size_t, size_t>> mergedRanges(
     return out;
 }
 
-// Conceal ranges minus spans revealed by the cursor: a span reveals (shows
-// raw source) when the cursor lies in its full source extent. Without a
-// cursor on the line, everything concealed stays hidden.
-std::vector<std::pair<size_t, size_t>> skipRangesFor(
+// Conceal ranges minus spans revealed by the cursor or the selection:
+// a span reveals (shows raw source) when the cursor lies in its full
+// source extent, or when the selection overlaps its source extent.
+// Without either on the line, everything concealed stays hidden.
+std::vector<std::pair<size_t, size_t>> skipRangesForSel(
     const std::vector<Span>& spans,
     const std::vector<std::pair<size_t, size_t>>& conceal, bool hasCursor,
-    size_t cx) {
-    if (!hasCursor) return mergedRanges(conceal);
+    size_t cx, bool selOnLine, size_t selA, size_t selB) {
+    if (!hasCursor && !selOnLine) return mergedRanges(conceal);
     std::vector<std::pair<size_t, size_t>> keep;
     for (const auto& r : conceal) {
         bool revealed = false;
         for (const auto& s : spans) {
-            if (cx >= s.srcStart && cx <= s.srcEnd && r.first >= s.srcStart &&
-                r.second <= s.srcEnd) {
+            if (r.first < s.srcStart || r.second > s.srcEnd) continue;
+            if (hasCursor && cx >= s.srcStart && cx <= s.srcEnd) {
+                revealed = true;
+                break;
+            }
+            if (selOnLine && selA <= s.srcEnd && selB >= s.srcStart) {
                 revealed = true;
                 break;
             }
@@ -237,7 +251,7 @@ std::vector<std::pair<size_t, size_t>> skipRangesFor(
 std::vector<Segment> layoutContent(
     const std::string& text, size_t cs, const std::vector<Span>& spans,
     const std::vector<std::pair<size_t, size_t>>& skipped, int packN,
-    int packD) {
+    int packD, size_t selStart, size_t selEnd) {
     int G0 = 0, W0 = 0, maxK = 0;
     if (packN > 0 && packD > packN) {
         int g = std::gcd(packN, packD);
@@ -295,6 +309,10 @@ std::vector<Segment> layoutContent(
         }
     };
     while (i < text.size()) {
+        if (selStart < selEnd && (i == selStart || i == selEnd)) {
+            flushRun(i);
+            runStart = i;
+        }
         auto [cp, len] = utf8::decode(text, i);
         if (len == 0) break;
         while (skipIdx < skipped.size() && i >= skipped[skipIdx].second)
@@ -444,7 +462,8 @@ void Renderer::ensureVisible(size_t cy, int viewRows) {
 LineLayout Renderer::layoutLine(const std::string& line, size_t contentStart,
                                 const std::vector<Span>& spans,
                                 const std::vector<std::pair<size_t, size_t>>& skip,
-                                const HeaderStyle& style, size_t markerCells) {
+                                const HeaderStyle& style, size_t markerCells,
+                                size_t selStart, size_t selEnd) {
     LineLayout lay;
     lay.sized = supp_.scale && style.s > 1;
     lay.contentStart = contentStart;
@@ -466,13 +485,19 @@ LineLayout Renderer::layoutLine(const std::string& line, size_t contentStart,
     } else {
         lay.text = line;
     }
+    lay.selStart = std::min(selStart, line.size());
+    lay.selEnd = std::min(selEnd, line.size());
+    if (!lay.byteMap.empty()) {
+        lay.selStart = lay.byteMap[lay.selStart];
+        lay.selEnd = lay.byteMap[lay.selEnd];
+    }
     lay.segs = layoutContent(lay.text, lay.contentStart, lay.spans, lay.skip,
                              (lay.sized && style.n > 0 && style.d > style.n)
                                  ? style.n
                                  : 0,
                              (lay.sized && style.n > 0 && style.d > style.n)
                                  ? style.d
-                                 : 0);
+                                 : 0, lay.selStart, lay.selEnd);
     return lay;
 }
 
@@ -484,15 +509,28 @@ void Renderer::emitLayout(const LineLayout& lay, const std::string& baseSgr,
     out += baseSgr;
     Style curStyle{};
     bool haveCur = false;
+    bool rev = false;  // selection reverse currently active
+    // Selection uses reverse-video toggles (7/27) so bold/color survive;
+    // 0m resets clear it, so re-apply after every style change.
     for (const auto& g : lay.segs) {
+        bool gsel = lay.selStart < lay.selEnd &&
+                    g.start >= lay.selStart && g.end <= lay.selEnd;
         if (!haveCur || g.style != curStyle) {
             if (haveCur) {
                 out += sgr::kReset;
                 out += baseSgr;
+                rev = false;
             }
             out += styleSgr(g.style);
             curStyle = g.style;
             haveCur = true;
+        }
+        if (gsel && !rev) {
+            out += sgr::kReverse;
+            rev = true;
+        } else if (!gsel && rev) {
+            out += "\x1b[27m";
+            rev = false;
         }
         std::string chunk = lay.text.substr(g.start, g.end - g.start);
         if (!lay.sized) {
@@ -516,17 +554,34 @@ void Renderer::emitLayout(const LineLayout& lay, const std::string& baseSgr,
                                 style.v, style.h);
         }
     }
+    if (rev) out += "\x1b[27m";
     out += sgr::kReset;
     term_.writeStr(out);
 }
 
 bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
+                               bool selActive, size_t selAx, size_t selAy,
                                size_t& outCx, size_t& outCy) {
     int rows = term_.rows();
     int cols = term_.cols();
     if (sx < 1 || sx > cols || sy < 1 || sy > rows - 1) return false;
     size_t n = buf_.lineCount();
     if (n == 0 || topLine_ >= n) return false;
+    // Normalized selection (anchor vs cursor head), clamped to lines.
+    bool selOn = selActive && (selAx != curCx || selAy != curCy);
+    size_t selY0 = 0, selX0 = 0, selY1 = 0, selX1 = 0;
+    if (selOn) {
+        size_t ay = selAy < n ? selAy : n - 1;
+        size_t hy = curCy < n ? curCy : n - 1;
+        selY0 = ay;
+        selX0 = buf_.clampToChar(ay, selAx);
+        selY1 = hy;
+        selX1 = buf_.clampToChar(hy, curCx);
+        if (selY1 < selY0 || (selY1 == selY0 && selX1 < selX0)) {
+            std::swap(selY0, selY1);
+            std::swap(selX0, selX1);
+        }
+    }
     int target = sy - 1;  // 0-based screen row
     // Fence-aware walk from topLine_, mirroring draw().
     bool inFence = false;
@@ -555,12 +610,14 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
         bool lineCursor = (y == curCy);
         bool showMarker = !plainKind && !p.marker.empty() &&
                           (!isHeader || lineCursor);
-        int packN = 0, packD = 0;
-        bool sized = supp_.scale && hs.s > 1;
-        if (sized && hs.n > 0 && hs.d > hs.n) {
-            packN = hs.n;
-            packD = hs.d;
+        size_t selA = 0, selB = 0;
+        bool selOnLine = selOn && y >= selY0 && y <= selY1;
+        if (selOnLine) {
+            selA = (y == selY0) ? selX0 : 0;
+            selB = (y == selY1) ? selX1 : line.size();
+            selOnLine = selA < selB;
         }
+        bool sized = supp_.scale && hs.s > 1;
         // Mirror of draw(): only the '#' run is scaled; separator is 1-cell.
         MarkerParts cmp;
         std::string chash;
@@ -576,8 +633,11 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
                 cmp = splitHeaderMarker(line, p.marker.size());
                 chash =
                     line.substr(cmp.hstart, cmp.hend - cmp.hstart);
-                chashSegs =
-                    layoutContent(chash, 0, {}, {}, packN, packD);
+                LineLayout hashLay = layoutLine(
+                    chash, 0, {}, {}, hs, 0,
+                    selA > cmp.hstart ? selA - cmp.hstart : 0,
+                    selB > cmp.hstart ? selB - cmp.hstart : 0);
+                chashSegs = std::move(hashLay.segs);
                 cIndent = cellsBefore(line, 0, cmp.hstart);
                 for (const auto& g : chashSegs) {
                     if (g.w > 0) {
@@ -601,11 +661,22 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
             }
         }
         bool hasCursor = (y == curCy);
-        auto skip0 = skipRangesFor(p.spans, p.conceal, hasCursor,
-                                   hasCursor ? curCx : 0);
+        auto skip0 = skipRangesForSel(p.spans, p.conceal, hasCursor,
+                                      hasCursor ? curCx : 0, selOnLine, selA,
+                                      selB);
         std::vector<Span> useSpans = plainKind ? std::vector<Span>{} : p.spans;
-        auto segs = layoutContent(line, cs, useSpans, skip0, packN, packD);
-        int s = sized ? hs.s : 1;
+        LineLayout lay = layoutLine(line, cs, useSpans, skip0, hs,
+                                    markerCells, selA, selB);
+        auto originalOffset = [&](size_t off) {
+            if (lay.byteMap.empty()) return buf_.clampToChar(y, off);
+            auto it = std::upper_bound(lay.byteMap.begin(), lay.byteMap.end(),
+                                       off);
+            size_t original = it == lay.byteMap.begin()
+                                  ? 0
+                                  : static_cast<size_t>(it - lay.byteMap.begin() - 1);
+            return buf_.clampToChar(y, original);
+        };
+        int s = lay.sized ? hs.s : 1;
         long rel = static_cast<long>(sx - 1) - static_cast<long>(markerCells);
         if (rel < 0) {
             if (csizedHashes) {
@@ -696,15 +767,15 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
         size_t abscol = markerCells;
         size_t acc = 0;
         size_t targetCol = static_cast<size_t>(rel);
-        for (const auto& g : segs) {
+        for (const auto& g : lay.segs) {
             size_t segAdv;
-            if (sized && g.w > 0) {
+            if (lay.sized && g.w > 0) {
                 segAdv = static_cast<size_t>(s * g.w);
             } else {
                 segAdv = 0;
                 size_t k = g.start;
                 while (k < g.end) {
-                    auto [cp, len] = utf8::decode(line, k);
+                    auto [cp, len] = utf8::decode(lay.text, k);
                     if (len == 0) break;
                     size_t cur = abscol + segAdv;
                     size_t gad;
@@ -714,7 +785,7 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
                         gad = static_cast<size_t>(s * utf8::charWidth(cp));
                     }
                     if (targetCol < acc + segAdv + gad) {
-                        outCx = k;  // click inside glyph -> its start
+                        outCx = originalOffset(k);
                         return true;
                     }
                     segAdv += gad;
@@ -730,7 +801,7 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
                     idx = static_cast<size_t>(c) - 1;
                 size_t off = (c > 1) ? std::min(g.start + idx, g.end)
                                      : g.start;
-                outCx = off;
+                outCx = originalOffset(off);
                 return true;
             }
             acc += segAdv;
@@ -742,13 +813,31 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
     return false;  // filler area below content: ignore
 }
 
-void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool promptActive,
-                    const std::string& promptText) {
+void Renderer::draw(size_t cx, size_t cy, bool selActive, size_t selAx,
+                    size_t selAy, const std::string& status,
+                    bool promptActive, const std::string& promptText) {
     term_.refreshSize();
     int rows = term_.rows();
     int cols = term_.cols();
     size_t n = buf_.lineCount();
     if (cy >= n) cy = n == 0 ? 0 : n - 1;
+
+    // Normalized selection, hidden while a prompt owns the screen.
+    bool selOn = selActive && !promptActive && n > 0;
+    size_t selY0 = 0, selX0 = 0, selY1 = 0, selX1 = 0;
+    if (selOn) {
+        size_t ay = selAy < n ? selAy : n - 1;
+        size_t hy = cy < n ? cy : n - 1;
+        selY0 = ay;
+        selX0 = buf_.clampToChar(ay, selAx);
+        selY1 = hy;
+        selX1 = buf_.clampToChar(hy, cx);
+        if (selY1 < selY0 || (selY1 == selY0 && selX1 < selX0)) {
+            std::swap(selY0, selY1);
+            std::swap(selX0, selX1);
+        }
+        selOn = (selY0 != selY1 || selX0 != selX1);
+    }
 
     if (rows < 3 || cols < 20) {
         term_.writeStr("\x1b[H\x1b[2J");
@@ -785,45 +874,71 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
         term_.writeStr("\x1b[2K");  // erase stale multicells on this row
 
         if (p.block == BlockType::Empty) {
-            // nothing
-        } else if (p.block == BlockType::CodeFence) {
-            term_.writeStr(sgr::kDim);
-            term_.writeStr(line);
-            term_.writeStr(sgr::kReset);
-        } else if (p.block == BlockType::CodeBlock) {
-            term_.writeStr(line);  // normal body text, no dimming
-        } else if (p.block == BlockType::HRule) {
-            term_.writeStr(sgr::kDim);
-            term_.writeStr(line);
-            term_.writeStr(sgr::kReset);
+            // A selected empty line inside a multi-line selection paints
+            // full-width so the selection reads as continuous.
+            if (selOn && y > selY0 && y < selY1) {
+                term_.writeStr(sgr::kReverse);
+                term_.writeStr(std::string(cols > 0 ? (size_t)cols : 0, ' '));
+                term_.writeStr(sgr::kReset);
+            }
+        } else if (p.block == BlockType::CodeFence ||
+                   p.block == BlockType::CodeBlock ||
+                   p.block == BlockType::HRule) {
+            // Plain-text lines: highlight the selected byte range inline.
+            bool selLine = selOn && y >= selY0 && y <= selY1;
+            size_t selA = 0, selB = 0;
+            if (selLine) {
+                selA = (y == selY0) ? std::min(selX0, line.size()) : 0;
+                selB = (y == selY1) ? std::min(selX1, line.size())
+                                    : line.size();
+                selLine = selA < selB;
+            }
+            std::string body =
+                selLine ? highlightPlain(line, selA, selB) : line;
+            if (p.block == BlockType::CodeBlock) {
+                term_.writeStr(body);  // normal body text, no dimming
+            } else {
+                term_.writeStr(sgr::kDim);
+                term_.writeStr(body);
+                term_.writeStr(sgr::kReset);
+            }
         } else {
             // Header `#` markers are concealed unless the cursor is on the
             // line (like inline `**`/`*`/backtick markers). All other block
             // markers (`>`, `-`, `1.`) stay dimmed inline. A revealed header
             // marker renders inline at the same Kitty scale as its text.
             bool hasCursor = (y == cy) && !promptActive;
+            // Selection byte range on this line (original line offsets).
+            bool selLine = selOn && y >= selY0 && y <= selY1;
+            size_t selA = 0, selB = 0;
+            if (selLine) {
+                selA = (y == selY0) ? std::min(selX0, line.size()) : 0;
+                selB = (y == selY1) ? std::min(selX1, line.size())
+                                    : line.size();
+                selLine = selA < selB;
+            }
             bool isHeader = p.headerLevel >= 1;
             bool showMarker =
                 !p.marker.empty() && (!isHeader || hasCursor);
             bool sized = supp_.scale && hs.s > 1;
-            int packN = (sized && hs.n > 0 && hs.d > hs.n) ? hs.n : 0;
-            int packD = (sized && hs.n > 0 && hs.d > hs.n) ? hs.d : 0;
             // Sized-header marker pieces: only the '#' run is scaled; the
             // separator space stays 1 cell so `## Text` keeps a normal gap.
             // (Kept in scope for the cursor-advance math below.)
             MarkerParts mp;
             std::string hashText;
-            std::vector<Segment> hashSegs;
+            LineLayout hashLay;
             size_t indentCells = 0, hashAdv = 0, sepCells = 0;
             size_t markerCells = 0;
             bool sizedHashes = showMarker && isHeader && sized;
             if (sizedHashes) {
                 mp = splitHeaderMarker(line, p.marker.size());
                 hashText = line.substr(mp.hstart, mp.hend - mp.hstart);
-                hashSegs =
-                    layoutContent(hashText, 0, {}, {}, packN, packD);
+                hashLay = layoutLine(
+                    hashText, 0, {}, {}, hs, 0,
+                    selA > mp.hstart ? selA - mp.hstart : 0,
+                    selB > mp.hstart ? selB - mp.hstart : 0);
                 indentCells = cellsBefore(line, 0, mp.hstart);
-                for (const auto& g : hashSegs) {
+                for (const auto& g : hashLay.segs) {
                     if (g.w > 0) {
                         hashAdv += static_cast<size_t>(hs.s * g.w);
                     } else {
@@ -844,34 +959,19 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
                 markerCells = cellsBefore(line, 0, p.marker.size());
             }
             if (sizedHashes) {
-                std::string mout;
-                mout += sgr::kDim;
-                mout += line.substr(0, mp.hstart);  // indent, unsized
-                for (const auto& g : hashSegs) {
-                    std::string chunk =
-                        hashText.substr(g.start, g.end - g.start);
-                    if (g.w == 0) {
-                        size_t pos = 0;
-                        while (pos < chunk.size()) {
-                            size_t nn = std::min<size_t>(
-                                3000, chunk.size() - pos);
-                            mout += kitty::sized(chunk.substr(pos, nn),
-                                                 hs.s, 0, hs.n, hs.d,
-                                                 hs.v, hs.h);
-                            pos += nn;
-                        }
-                    } else {
-                        int w = g.w > 7 ? 7 : g.w;
-                        mout += kitty::sized(chunk, hs.s, w, hs.n, hs.d,
-                                             hs.v, hs.h);
-                    }
-                }
-                mout += line.substr(mp.hend, mp.msize - mp.hend);  // separator
-                mout += sgr::kReset;
-                term_.writeStr(mout);
+                term_.writeStr(sgr::kDim);
+                term_.writeStr(highlightPlain(line.substr(0, mp.hstart),
+                                               selA, selB));
+                emitLayout(hashLay, sgr::kDim, hs);
+                term_.writeStr(sgr::kDim);
+                term_.writeStr(highlightPlain(
+                    line.substr(mp.hend, mp.msize - mp.hend),
+                    selA > mp.hend ? selA - mp.hend : 0,
+                    selB > mp.hend ? selB - mp.hend : 0));
+                term_.writeStr(sgr::kReset);
             } else if (showMarker) {
                 term_.writeStr(sgr::kDim);
-                term_.writeStr(p.marker);
+                term_.writeStr(highlightPlain(p.marker, selA, selB));
                 term_.writeStr(sgr::kReset);
             }
             std::string base;
@@ -883,12 +983,14 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
                 !p.marker.empty()) {
                 // marker already drawn dimmed; acceptable
             }
-            // Span-level reveal: hidden formatting shows raw source only
-            // when the cursor is inside the formatted span's extent.
+            // Span-level reveal: hidden formatting shows raw source when
+            // the cursor is inside the formatted span's extent, or when
+            // the selection overlaps it.
             // (hasCursor already computed above for marker concealment.)
-            auto skip0 = skipRangesFor(p.spans, p.conceal, hasCursor, cx);
+            auto skip0 = skipRangesForSel(p.spans, p.conceal, hasCursor, cx,
+                                          selLine, selA, selB);
             LineLayout lay = layoutLine(line, p.contentStart, p.spans, skip0,
-                                        hs, markerCells);
+                                        hs, markerCells, selA, selB);
             emitLayout(lay, base, hs);
 
             if (hasCursor) {
@@ -898,7 +1000,7 @@ void Renderer::draw(size_t cx, size_t cy, const std::string& status, bool prompt
                         colCells = cellsBefore(line, 0, cx);
                     } else if (cx < mp.hend) {
                         colCells = indentCells +
-                                   advanceUpTo(hashText, hashSegs, hs.s,
+                                   advanceUpTo(hashText, hashLay.segs, hs.s,
                                                true, 0, cx - mp.hstart);
                     } else {
                         colCells = indentCells + hashAdv +

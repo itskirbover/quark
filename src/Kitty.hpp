@@ -9,6 +9,7 @@ struct KittySupport {
     bool width = false;    // terminal honors w=
     bool scale = false;    // terminal honors s= / n:d
     bool graphics = false;  // terminal answers the graphics (image) protocol
+    bool keyboard = false;  // terminal confirmed disambiguated keyboard mode
     bool any() const { return width || scale; }
 };
 
@@ -34,6 +35,14 @@ bool cellSizePx(int& w, int& h);
 // Same TTY-in-raw-mode requirement as detectSupport. Sets out.graphics;
 // preserves the width/scale fields. Returns true if the probe completed.
 bool detectGraphics(KittySupport& out);
+
+// Push disambiguated keyboard mode (CSI > 1 u) and query support
+// (CSI ? u). Same TTY-in-raw-mode requirement as detectSupport.
+// On a confirming reply sets out.keyboard (caller enables the mode for
+// editing and pops it on exit); otherwise pops immediately so nothing
+// lingers. Preserves the other support fields. Returns true if a reply
+// was parsed.
+bool detectKeyboard(KittySupport& out);
 
 // Transmit raw PNG bytes as image id. Chunked base64 (q=2: no replies).
 // Returns the APC sequence(s); empty if png is empty.
