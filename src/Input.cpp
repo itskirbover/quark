@@ -325,13 +325,10 @@ Key readEscapeSequence() {
     return Key::make(Key::Type::None);
 }
 
-}  // namespace
-
-Key InputReader::readKey() {
-    int c = readByte(-1);  // block (raw VTIME still bounds each read)
-    // readByte(-1): select with negative timeout -> wait indefinitely.
-    while (c == -1) c = readByte(-1);
-    if (c == -2) return Key::make(Key::Type::None);  // EOF: no key
+// Decode a consumed first byte into a logical key (shared by the
+// blocking and timed reads; escape-sequence follow-ups use their own
+// short timeouts as before).
+Key decodeFirstByte(int c) {
     if (c == 0x1B) return readEscapeSequence();
     if (c == 0x03) return Key::make(Key::Type::CtrlC);
     if (c == 0x13) return Key::make(Key::Type::CtrlS);
@@ -359,4 +356,20 @@ Key InputReader::readKey() {
     k.text = bytes;
     k.cp = cp;
     return k;
+}
+
+}  // namespace
+
+Key InputReader::readKey() {
+    int c = readByte(-1);  // block (raw VTIME still bounds each read)
+    // readByte(-1): select with negative timeout -> wait indefinitely.
+    while (c == -1) c = readByte(-1);
+    if (c == -2) return Key::make(Key::Type::None);  // EOF: no key
+    return decodeFirstByte(c);
+}
+
+Key InputReader::readKeyTimeout(int timeoutMs) {
+    int c = readByte(timeoutMs);
+    if (c == -1 || c == -2) return Key::make(Key::Type::None);  // timeout/EOF
+    return decodeFirstByte(c);
 }

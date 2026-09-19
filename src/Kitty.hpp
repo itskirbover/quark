@@ -72,7 +72,7 @@ inline const char* kH4 = "\x1b[1;92m";
 inline const char* kH5 = "\x1b[1;93m";
 inline const char* kH6 = "\x1b[1;91m";
 inline const char* kQuote = "\x1b[36m";
-inline const char* kCode = "\x1b[97;40m";
+inline const char* kCode = "\x1b[97;48;5;239m";
 inline const char* kLink = "\x1b[4;34m";
 inline const char* kListMark = "\x1b[33m";
 }  // namespace sgr

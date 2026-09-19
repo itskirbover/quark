@@ -53,4 +53,7 @@ class InputReader {
 public:
     // Blocking read of one logical key.
     Key readKey();
+    // Like readKey(), but returns Key::Type::None if no key arrives
+    // within timeoutMs (lets callers poll, e.g. for window resizes).
+    Key readKeyTimeout(int timeoutMs);
 };

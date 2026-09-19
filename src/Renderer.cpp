@@ -34,9 +34,10 @@ MarkerParts splitHeaderMarker(const std::string& line, size_t markerLen) {
     return m;
 }
 
-// Display cells of line[from,to) with tab stops every 8.
-size_t cellsBefore(const std::string& line, size_t from, size_t to) {
-    size_t col = 0;
+// Display cells of line[from,to) with tab stops every 8 from baseCol.
+size_t cellsBefore(const std::string& line, size_t from, size_t to,
+                   size_t baseCol = 0) {
+    size_t col = baseCol;
     size_t i = from;
     if (i > line.size()) i = line.size();
     if (to > line.size()) to = line.size();
@@ -564,7 +565,9 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
                                size_t& outCx, size_t& outCy) {
     int rows = term_.rows();
     int cols = term_.cols();
-    if (sx < 1 || sx > cols || sy < 1 || sy > rows - 1) return false;
+    // Clicks on the status pills (last three rows) are not content.
+    int contentLast = rows >= 4 ? rows - 3 : rows - 1;
+    if (sx < 1 || sx > cols || sy < 1 || sy > contentLast) return false;
     size_t n = buf_.lineCount();
     if (n == 0 || topLine_ >= n) return false;
     // Normalized selection (anchor vs cursor head), clamped to lines.
@@ -678,6 +681,15 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
         };
         int s = lay.sized ? hs.s : 1;
         long rel = static_cast<long>(sx - 1) - static_cast<long>(markerCells);
+        // CodeBlock rows render with a one-cell display pad: clicks on
+        // the pad gutter map to offset 0, the rest shifts by one.
+        if (p.block == BlockType::CodeBlock) {
+            if (rel <= 0) {
+                outCx = 0;
+                return true;
+            }
+            rel -= 1;
+        }
         if (rel < 0) {
             if (csizedHashes) {
                 // Region-aware walk: unsized indent, scaled '#' run,
@@ -763,8 +775,10 @@ bool Renderer::screenToLogical(int sx, int sy, size_t curCx, size_t curCy,
             outCx = k;
             return true;
         }
-        // Inverse segment walk from the content origin.
-        size_t abscol = markerCells;
+        // Inverse segment walk from the content origin (past the
+        // CodeBlock display pad, whose width rel already excludes).
+        size_t abscol = markerCells +
+                        (p.block == BlockType::CodeBlock ? 1 : 0);
         size_t acc = 0;
         size_t targetCol = static_cast<size_t>(rel);
         for (const auto& g : lay.segs) {
@@ -845,7 +859,11 @@ void Renderer::draw(size_t cx, size_t cy, bool selActive, size_t selAx,
         term_.hideCursor();
         return;
     }
-    int viewRows = rows - 1;  // last row = status bar
+    // Status pills are 3-row bordered boxes docked at the bottom, so
+    // rows >= 4 leaves rows - 3 content rows; a 3-row window gets a
+    // single plain bar row.
+    bool framedBar = rows >= 4;
+    int viewRows = framedBar ? rows - 3 : rows - 1;
     ensureVisible(cy, viewRows);
 
     term_.hideCursor();
@@ -896,7 +914,22 @@ void Renderer::draw(size_t cx, size_t cy, bool selActive, size_t selAx,
             std::string body =
                 selLine ? highlightPlain(line, selA, selB) : line;
             if (p.block == BlockType::CodeBlock) {
-                term_.writeStr(body);  // normal body text, no dimming
+                // Dark text with a one-cell display pad (offsets stay
+                // line-based; cursor/click math compensates below).
+                term_.writeStr(sgr::kDim);
+                term_.writeStr(" ");
+                term_.writeStr(body);
+                term_.writeStr(sgr::kReset);
+            } else if (p.block == BlockType::CodeFence) {
+                // Fence delimiters stay hidden unless the cursor is on
+                // the line (same reveal convention as concealed `#` and
+                // inline markers); the row itself is already erased, so
+                // a hidden fence just leaves a blank row.
+                if ((y == cy) && !promptActive) {
+                    term_.writeStr(sgr::kDim);
+                    term_.writeStr(body);
+                    term_.writeStr(sgr::kReset);
+                }
             } else {
                 term_.writeStr(sgr::kDim);
                 term_.writeStr(body);
@@ -1031,7 +1064,11 @@ void Renderer::draw(size_t cx, size_t cy, bool selActive, size_t selAx,
         if (y == cy && !promptActive && !cursorPlaced &&
             (p.block == BlockType::Empty || p.block == BlockType::CodeFence ||
              p.block == BlockType::CodeBlock || p.block == BlockType::HRule)) {
-            size_t c = 1 + cellsBefore(line, 0, cx);
+            // CodeBlock rows render with a one-cell display pad (tabs
+            // measured from column 1 to match); cellsBefore already
+            // includes the base column.
+            size_t base = (p.block == BlockType::CodeBlock) ? 1 : 0;
+            size_t c = 1 + cellsBefore(line, 0, cx, base);
             if (c > static_cast<size_t>(cols)) c = cols;
             cursorScreenRow = screenRow;
             cursorScreenCol = c;
@@ -1048,104 +1085,134 @@ void Renderer::draw(size_t cx, size_t cy, bool selActive, size_t selAx,
         term_.writeStr(sgr::kReset);
     }
 
-    // Status bar: LazyVim-like blocks (left = filename, right = context).
-    term_.writeStr(cup(rows, 1));
-    term_.writeStr("\x1b[2K");
+    // Status bar: separate bordered pills, black background with white
+    // text (no fills). The filename (left) and position (right) each get
+    // a full rounded border; the empty middle has no frame. A transient
+    // status message shows centered between the pills.
+    // Draws one pill-box edge: `textW` text cells at 1-based column
+    // `col`; total width is textW + 4.
+    auto pillEdge = [&](int r, int col, int textW, bool top) {
+        std::string dashes;
+        for (int i = 0; i < textW + 2; ++i) dashes += "\u2500";  // ─
+        term_.writeStr(cup(r, col));
+        term_.writeStr(top ? "\u256d" + dashes + "\u256e"   // ╭ ╮
+                           : "\u2570" + dashes + "\u256f");  // ╰ ╯
+    };
     if (promptActive) {
         // promptText is fully formed by the caller (quit confirm includes
-        // "(y/n)"; save-as shows the path being typed).
-        std::string bar = promptText;
-        if (bar.size() > static_cast<size_t>(cols)) {
-            size_t cut = cols;
-            while (cut > 0 &&
-                   utf8::isContinuation(static_cast<unsigned char>(bar[cut])))
-                --cut;
-            bar.erase(cut);
+        // "(y/n)"; save-as shows the path being typed). Own fitted pill
+        // border, centered.
+        std::string shown = truncateCells(promptText, static_cast<size_t>(cols > 4 ? cols - 4 : 0));
+        int tW = static_cast<int>(visibleWidth(shown));
+        if (framedBar) {
+            int bw = tW + 4;
+            int left = (cols - bw) / 2 + 1;
+            if (left < 1) left = 1;
+            pillEdge(rows - 2, left, tW, true);
+            term_.writeStr(cup(rows - 1, left));
+            term_.writeStr("\u2502 ");  // │
+            term_.writeStr(shown);
+            term_.writeStr(" \u2502");  // │
+            pillEdge(rows, left, tW, false);
+            int cc = left + 2 + static_cast<int>(shown.size());
+            if (cc > left + bw - 2) cc = left + bw - 2;
+            term_.writeStr(cup(rows - 1, cc));
+        } else {
+            size_t start = static_cast<size_t>(tW) < static_cast<size_t>(cols)
+                               ? (static_cast<size_t>(cols) -
+                                  static_cast<size_t>(tW)) /
+                                     2
+                               : 0;
+            term_.writeStr(cup(rows, 1));
+            term_.writeStr("\x1b[2K");
+            term_.writeStr(std::string(start, ' '));
+            term_.writeStr(shown);
+            int cc = static_cast<int>(start + shown.size());
+            if (cc > cols) cc = cols;
+            term_.writeStr(cup(rows, cc + 1));
         }
-        bar += std::string(cols > (int)bar.size() ? (cols - bar.size()) : 0,
-                           ' ');
-        term_.writeStr("\x1b[7m");
-        term_.writeStr(bar);
-        term_.writeStr(sgr::kReset);
+        term_.showCursor();
     } else {
         std::string name = buf_.filename().empty() ? "[no file]" : buf_.filename();
         std::string mod = buf_.dirty() ? "[+]" : "";
         size_t charCol = utf8::charCount(buf_.line(cy).substr(
             0, std::min(cx, buf_.line(cy).size())));
-        std::string kittyTag = !supp_.any() ? "plain"
-                               : (supp_.scale ? "kitty-full" : "kitty-width");
         std::string pos = "Ln " + std::to_string(cy + 1) + "/" +
                           std::to_string(n) + " Col " +
                           std::to_string(charCol + 1);
-        std::string scroll = (cy == 0) ? "Top"
-                             : (cy + 1 >= n)
-                                   ? "Bot"
-                                   : std::to_string(cy * 100 /
-                                                    std::max<size_t>(n - 1, 1)) +
-                                         "%";
-        char tbuf[6] = "";
-        {
-            time_t t = time(nullptr);
-            strftime(tbuf, sizeof(tbuf), "%H:%M", localtime(&t));
+        // Right pill always shown (truncated only in absurd cases);
+        // left pill dropped when nothing fits (1-cell gap kept).
+        size_t maxRInner = cols > 4 ? static_cast<size_t>(cols - 4) : 0;
+        std::string rShown = truncateCells(pos, maxRInner);
+        int rW = static_cast<int>(visibleWidth(rShown));
+        int Rp = rW + 4;
+        std::string lShown;
+        int lW = 0;
+        int Lp = 0;
+        if (cols - Rp - 5 >= 1) {
+            lShown = truncateCells(name + mod,
+                                   static_cast<size_t>(cols - Rp - 5));
+            lW = static_cast<int>(visibleWidth(lShown));
+            Lp = lW + 4;
         }
-        // Tiered right side for narrow windows: clock, then scroll %.
-        // Position and kitty tag always stay; the filename truncates last.
-        // Tiers drop until the middle (status/hints) fits, if possible.
-        std::string midWant = status.empty()
-                                  ? "Ctrl-C quit  Ctrl-S save  click to move"
-                                  : " " + status;
-        size_t needMid = visibleWidth(midWant);
-        bool showClock = true, showScroll = true;
-        std::string right;
-        std::string leftText = " " + name + mod + " ";
-        size_t rightW = 0, maxLeft = 0, midAvail = 0;
-        for (;;) {
-            right = std::string(sgr::kDim) + " " + kittyTag + " " +
-                    sgr::kReset;
-            std::string posSeg = pos;
-            if (showScroll) posSeg = scroll + " " + posSeg;
-            right += std::string("\x1b[97;44m ") + posSeg + " " + sgr::kReset;
-            if (showClock)
-                right +=
-                    std::string("\x1b[30;104m ") + tbuf + " " + sgr::kReset;
-            rightW = visibleWidth(right);
-            maxLeft = (static_cast<size_t>(cols) > rightW + 1)
-                          ? static_cast<size_t>(cols) - rightW - 1
-                          : 0;
-            size_t leftW =
-                std::min(visibleWidth(leftText), maxLeft);
-            midAvail = (static_cast<size_t>(cols) > leftW + rightW)
-                           ? static_cast<size_t>(cols) - leftW - rightW
-                           : 0;
-            if (midAvail >= needMid || (!showClock && !showScroll)) break;
-            if (showClock)
-                showClock = false;
-            else
-                showScroll = false;
+        if (framedBar) {
+            if (Lp > 0) {
+                pillEdge(rows - 2, 1, lW, true);
+                term_.writeStr(cup(rows - 1, 1));
+                term_.writeStr("\u2502 " + lShown + " \u2502");  // │ │
+            }
+            int rLeft = cols - Rp + 1;
+            pillEdge(rows - 2, rLeft, rW, true);
+            term_.writeStr(cup(rows - 1, rLeft));
+            term_.writeStr("\u2502 " + rShown + " \u2502");  // │ │
+            pillEdge(rows, rLeft, rW, false);
+            if (Lp > 0) {
+                pillEdge(rows, 1, lW, false);
+                // Transient status centered in the gap (no border there).
+                int gapL = Lp + 1, gapR = cols - Rp;
+                int gap = gapR - gapL + 1;
+                if (!status.empty() && gap > 0) {
+                    std::string mid =
+                        truncateCells(status, static_cast<size_t>(gap));
+                    int midW = static_cast<int>(visibleWidth(mid));
+                    term_.writeStr(cup(rows - 1, gapL + (gap - midW) / 2));
+                    term_.writeStr(sgr::kDim);
+                    term_.writeStr(mid);
+                    term_.writeStr(sgr::kReset);
+                }
+            } else if (!status.empty()) {
+                // No left pill: status fits the gap left of the right pill.
+                int gapOnly = cols - Rp;
+                if (gapOnly > 0) {
+                    std::string mid = truncateCells(
+                        status, static_cast<size_t>(gapOnly));
+                    term_.writeStr(cup(rows - 1, 1));
+                    term_.writeStr(sgr::kDim);
+                    term_.writeStr(mid);
+                    term_.writeStr(sgr::kReset);
+                }
+            }
+        } else {
+            // 3-row window: single plain row, no borders.
+            term_.writeStr(cup(rows, 1));
+            term_.writeStr("\x1b[2K");
+            std::string left = Lp > 0 ? " " + lShown + " " : " ";
+            std::string right = " " + rShown + " ";
+            int fill = cols - static_cast<int>(visibleWidth(left)) -
+                       static_cast<int>(visibleWidth(right));
+            if (fill < 0) fill = 0;
+            term_.writeStr(left);
+            term_.writeStr(std::string(static_cast<size_t>(fill), ' '));
+            term_.writeStr(right);
         }
-        std::string leftShown = truncateCells(leftText, maxLeft);
-        std::string mid = truncateCells(midWant, midAvail);
-        size_t pad =
-            (midAvail > visibleWidth(mid)) ? midAvail - visibleWidth(mid) : 0;
-        term_.writeStr("\x1b[30;104m");
-        term_.writeStr(leftShown);
-        term_.writeStr(sgr::kReset);
-        if (!mid.empty()) {
-            term_.writeStr(sgr::kDim);
-            term_.writeStr(mid);
-            term_.writeStr(sgr::kReset);
-        }
-        term_.writeStr(std::string(pad, ' '));
-        term_.writeStr(right);
     }
 
-    if (promptActive) {
-        term_.writeStr(cup(rows, (int)promptText.size() + 1));
-        term_.showCursor();
-    } else if (cursorPlaced) {
-        term_.writeStr(cup((int)cursorScreenRow + 1, (int)cursorScreenCol));
-        term_.showCursor();
-    } else {
-        term_.showCursor();
+    if (!promptActive) {
+        if (cursorPlaced) {
+            term_.writeStr(cup((int)cursorScreenRow + 1, (int)cursorScreenCol));
+            term_.showCursor();
+        } else {
+            term_.showCursor();
+        }
     }
 }
